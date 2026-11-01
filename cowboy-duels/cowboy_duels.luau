@@ -28,7 +28,11 @@ end
 
 -- Hooks survive re-execution (a closure can only be hooked once cleanly), so the
 -- hook registry and live config live in getgenv and every wrapper reads them.
-G.__CD_HOOKED = G.__CD_HOOKED or setmetatable({}, { __mode = "k" })
+-- Strong keys on purpose: hooked closures are kept alive after their tool is
+-- destroyed, so the executor never has to garbage-collect a hooked function
+-- (suspected source of random crashes). Costs a few closures per round.
+G.__CD_HOOKED = G.__CD_HOOKED or {}
+setmetatable(G.__CD_HOOKED, nil)
 G.__CD_SA = G.__CD_SA or {}
 local Hooked = G.__CD_HOOKED
 local SA = G.__CD_SA
@@ -51,8 +55,54 @@ local function bind(signal, fn)
 	return c
 end
 
+-- Crash breadcrumbs: the last ~200 log lines plus a 5 s heartbeat are mirrored
+-- to <executor workspace>/cd_crashlog.txt, so after a hard crash the tail of
+-- that file shows what the mod was doing. getgenv().CD_NO_CRASHLOG = true
+-- turns it off.
+local crumbs, crumbsDirty = {}, false
+local CRUMB_MAX = 200
+local CRUMB_FILE = "cd_crashlog.txt"
+local canWrite = type(writefile) == "function" and G.CD_NO_CRASHLOG ~= true
+
+-- Keep the previous session's log (the one that ended in a crash) before this
+-- session starts writing over it.
+if canWrite and type(readfile) == "function" then
+	pcall(function()
+		if type(isfile) ~= "function" or isfile(CRUMB_FILE) then
+			local old = readfile(CRUMB_FILE)
+			if type(old) == "string" and #old > 0 then
+				writefile("cd_crashlog_prev.txt", old)
+			end
+		end
+	end)
+end
+
+local function crumb(line)
+	if not canWrite then
+		return
+	end
+	table.insert(crumbs, string.format("%s %.2f %s", os.date("!%H:%M:%S"), os.clock(), line))
+	if #crumbs > CRUMB_MAX then
+		table.remove(crumbs, 1)
+	end
+	crumbsDirty = true
+end
+
+local function flushCrumbs()
+	if canWrite and crumbsDirty then
+		crumbsDirty = false
+		pcall(writefile, CRUMB_FILE, table.concat(crumbs, "\n") .. "\n")
+	end
+end
+
 local function log(...)
 	print("[CowboyDuels]", ...)
+	local parts = table.pack(...)
+	for i = 1, parts.n do
+		parts[i] = tostring(parts[i])
+	end
+	crumb(table.concat(parts, " ", 1, parts.n))
+	flushCrumbs() -- events are rare; write them immediately
 end
 
 -- Notifications raised before the UI exists are queued and shown once it loads.
@@ -475,45 +525,125 @@ local function hookClosure(f, kind)
 	return true
 end
 
--- getgc is heavy in this game (~35k modules), so only scan when a weapon shows
--- up whose fire closure we haven't hooked yet.
+-- getgc is heavy in this game (~35k modules), and on weaker executors a burst
+-- of full-heap scans freezes or crashes the client. So there is ONE scanner:
+-- tools queue up, a single getgc pass serves every queued tool at once, scans
+-- are spaced out, the walk yields every few thousand entries, and a tool that
+-- never yields its closure is given up on (no rescans on every equip).
+-- toolHooked[tool] = "pending" | true (hooked) | "failed"
 local toolHooked = setmetatable({}, { __mode = "k" })
+local pendingTools = {} -- [tool] = { kind = kind, tries = n }
+local scannerRunning = false
 
-local function closureFor(f, w, src)
+local SCAN_SPACING = 1.5 -- seconds between full scans
+local SCAN_MAX_TRIES = 5 -- per tool
+local SCAN_CHUNK = 4000 -- gc entries walked per frame
+
+local function closureKind(f, bySrc)
 	local ok, name = pcall(debug.info, f, "n")
-	if ok and table.find(w.fns, name) then
-		local okEnv, env = pcall(getfenv, f)
-		return okEnv and env and rawget(env, "script") == src
+	if not ok or not name or name == "" then
+		return nil
 	end
-	return false
+	local okEnv, env = pcall(getfenv, f)
+	local src = okEnv and type(env) == "table" and rawget(env, "script")
+	local entry = src and bySrc[src]
+	if entry and table.find(WEAPONS[entry.kind].fns, name) then
+		return entry
+	end
+	return nil
 end
 
-local function scanForTool(tool, kind)
-	local w = WEAPONS[kind]
-	local src = tool:FindFirstChild(w.script)
-	if not src then
-		return 0
-	end
-	local n = 0
-	for _, f in ipairs(getgc(false)) do
-		if type(f) == "function" and islclosure(f) and not Hooked[f] and closureFor(f, w, src) then
-			if hookClosure(f, kind) then
-				n += 1
-			end
-		end
-	end
-	return n
-end
-
-local function alreadyHooked(tool, kind)
-	local src = tool:FindFirstChild(WEAPONS[kind].script)
+local function alreadyHooked(src)
 	for f in pairs(Hooked) do
 		local okEnv, env = pcall(getfenv, f)
-		if okEnv and env and rawget(env, "script") == src then
+		if okEnv and type(env) == "table" and rawget(env, "script") == src then
 			return true
 		end
 	end
 	return false
+end
+
+-- One getgc pass for every queued tool. Returns nothing; updates toolHooked.
+local function scanPending()
+	local bySrc = {}
+	local any = false
+	for tool, p in pairs(pendingTools) do
+		local src = tool.Parent and tool:FindFirstChild(WEAPONS[p.kind].script)
+		if not src then
+			pendingTools[tool] = nil
+			toolHooked[tool] = nil
+		elseif alreadyHooked(src) then
+			-- Hooked by a previous execution of this script.
+			pendingTools[tool] = nil
+			toolHooked[tool] = true
+		else
+			bySrc[src] = { tool = tool, kind = p.kind, n = 0 }
+			any = true
+		end
+	end
+	if not any then
+		return
+	end
+
+	local okGc, gc = pcall(getgc, false)
+	if not okGc or type(gc) ~= "table" then
+		log("getgc failed:", tostring(gc))
+		gc = {}
+	end
+	local count = #gc
+	for i = 1, count do
+		local f = gc[i]
+		if type(f) == "function" and not Hooked[f] and islclosure(f) then
+			local entry = closureKind(f, bySrc)
+			if entry and hookClosure(f, entry.kind) then
+				entry.n += 1
+			end
+		end
+		if i % SCAN_CHUNK == 0 then
+			task.wait() -- spread the walk across frames instead of one long stall
+		end
+	end
+	gc = nil
+
+	for _, entry in pairs(bySrc) do
+		local tool = entry.tool
+		local p = pendingTools[tool]
+		if entry.n > 0 then
+			pendingTools[tool] = nil
+			toolHooked[tool] = true
+			log("hooked", entry.kind, tool.Name)
+		elseif p then
+			p.tries += 1
+			if p.tries >= SCAN_MAX_TRIES then
+				pendingTools[tool] = nil
+				toolHooked[tool] = "failed"
+				log("could not find", table.concat(WEAPONS[entry.kind].fns, "/"), "for", tool:GetFullName())
+			end
+		end
+	end
+end
+
+local function runScanner()
+	if scannerRunning then
+		return
+	end
+	scannerRunning = true
+	task.spawn(function()
+		-- Short settle so tools that arrive together (respawn, round start) share
+		-- one scan, and their LocalScripts get a moment to run.
+		task.wait(0.5)
+		while next(pendingTools) and not Mod.unloaded and CAPS.silentAim do
+			local ok, err = pcall(scanPending)
+			if not ok then
+				log("scan error:", err)
+			end
+			if next(pendingTools) then
+				task.wait(SCAN_SPACING)
+			end
+		end
+		table.clear(pendingTools)
+		scannerRunning = false
+	end)
 end
 
 local function watchTool(tool)
@@ -522,31 +652,11 @@ local function watchTool(tool)
 	end
 	local kind = weaponKind(tool)
 	if not kind or toolHooked[tool] then
-		return
+		return -- unknown, already hooked, queued, or given up on
 	end
 	toolHooked[tool] = "pending"
-	task.spawn(function()
-		-- The LocalScript needs a moment to run after the tool lands in Backpack.
-		for _ = 1, 12 do
-			if not tool.Parent then
-				break
-			end
-			local ok, n = pcall(scanForTool, tool, kind)
-			if ok and n > 0 then
-				toolHooked[tool] = true
-				log("hooked", kind, tool.Name)
-				return
-			end
-			-- Already hooked by a previous execution of this script.
-			if ok and alreadyHooked(tool, kind) then
-				toolHooked[tool] = true
-				return
-			end
-			task.wait(0.5)
-		end
-		toolHooked[tool] = nil
-		log("could not find", table.concat(WEAPONS[kind].fns, "/"), "for", tool:GetFullName())
-	end)
+	pendingTools[tool] = { kind = kind, tries = 0 }
+	runScanner()
 end
 
 local function watchContainer(container)
@@ -1438,6 +1548,44 @@ Mod.Debug = {
 	bestTarget = bestTarget,
 	aimPointFor = aimPointFor,
 }
+
+-- Crash-log heartbeat: a snapshot every 5 s, flushed at most once a second.
+task.spawn(function()
+	local beat = 0
+	while not Mod.unloaded do
+		task.wait(1)
+		beat += 1
+		if beat % 5 == 0 then
+			local nHooked, nEsp, nCoin, nPending = 0, 0, 0, 0
+			for _ in pairs(Hooked) do
+				nHooked += 1
+			end
+			for _ in pairs(espObjects) do
+				nEsp += 1
+			end
+			for _ in pairs(coinObjects) do
+				nCoin += 1
+			end
+			for _ in pairs(pendingTools) do
+				nPending += 1
+			end
+			crumb(string.format(
+				"hb mem=%dKB hooked=%d pending=%d esp=%d coins=%d duel=%s sa=%s aim=%s lock=%s espOn=%s",
+				math.floor(gcinfo()),
+				nHooked,
+				nPending,
+				nEsp,
+				nCoin,
+				tostring(inDuel()),
+				tostring(SA.Enabled),
+				tostring(Aim.Enabled),
+				tostring(Aim.locked ~= nil),
+				tostring(ESP.Enabled)
+			))
+		end
+		flushCrumbs()
+	end
+end)
 
 --------------------------------------------------------------------------------
 -- Unload
