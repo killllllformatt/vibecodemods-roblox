@@ -238,6 +238,77 @@ local function hookGrabShake()
 	return false
 end
 
+-- Scary Serum, measured 2026-11-05: the server only sets player attr FauxBruitsJusqua (now + 10 s).
+-- The rest runs in our own PlayerScripts.FauxBruits: an anonymous BindToRenderStep
+-- ("ScarySerumTouches", Input+1) re-routes MoveDirection through a random axis swap/flip with
+-- Humanoid:Move, and unBruit() plays fake footsteps/coughs (Part "FauxBruit" in the Camera) every
+-- 1.2-2.2 s. The render function has no name, so it's found by its constants. Hooks persist across
+-- reloads; S.antiSerum is read at call time.
+local function hookScarySerum()
+	if S.hookedSerum then
+		return true
+	end
+	if not CAN_HOOK or not debug.getconstants then
+		return false, "executor has no getgc/hookfunction/getconstants"
+	end
+	local target = localPlayer:WaitForChild("PlayerScripts"):FindFirstChild("FauxBruits")
+	if not target then
+		return false, "FauxBruits script not found"
+	end
+	local scramble, noise
+	for i, f in ipairs(getgc(false)) do
+		if type(f) == "function" and islclosure(f) then
+			local ok, env = pcall(getfenv, f)
+			if ok and env and rawget(env, "script") == target then
+				if debug.info(f, "n") == "unBruit" then
+					noise = f
+				else
+					local okc, consts = pcall(debug.getconstants, f)
+					if okc then
+						local set = {}
+						for _, c in ipairs(consts) do
+							if type(c) == "string" then
+								set[c] = true
+							end
+						end
+						if set.FauxBruitsJusqua and set.MoveDirection and set.CurrentCamera then
+							scramble = f
+						end
+					end
+				end
+			end
+		end
+		if i % GC_YIELD_EVERY == 0 then
+			task.wait()
+		end
+	end
+	if not scramble then
+		return false, "scramble function not found"
+	end
+	local oldScramble
+	oldScramble = hookfunction(scramble, function(...)
+		if S.antiSerum then
+			if (localPlayer:GetAttribute("FauxBruitsJusqua") or 0) > workspace:GetServerTimeNow() then
+				S.serumFrames = (S.serumFrames or 0) + 1
+			end
+			return
+		end
+		return oldScramble(...)
+	end)
+	if noise then
+		local oldNoise
+		oldNoise = hookfunction(noise, function(...)
+			if S.antiSerum then
+				S.serumNoises = (S.serumNoises or 0) + 1
+				return
+			end
+			return oldNoise(...)
+		end)
+	end
+	S.hookedSerum = true
+	return true
+end
+
 -- Pushes reach us as Projection(velocity, duration); kills send no duration. The client
 -- applies the fling and asks for its own ragdoll, so skipping the handler skips both.
 local function hookProjection()
@@ -571,17 +642,70 @@ local COLOR_BLIND = Color3.fromRGB(255, 50, 50)
 local COLOR_INFECTED = COLOR_BLIND
 local COLOR_HIDER = Color3.fromRGB(255, 255, 255)
 
+-- The game's own blind-man ESP (PlayerScripts.ContourBlindMan): 6 outline-only Highlights with
+-- DepthMode Occluded in Camera.ContoursBlindMan, re-adorned every 0.3 s. Roblox draws one Highlight
+-- per adornee, so theirs can win over ours and the blind man stops showing through walls. While our
+-- outlines are on, the game's Highlights are moved out of the DataModel. That script only writes
+-- Adornee/Enabled on them (it re-parents the folder, not the Highlights), so it keeps them up to date
+-- and they reappear correctly when they are put back.
+local gameContours = {}
+
+local function suppressGameContours()
+	local folder = workspace.CurrentCamera and workspace.CurrentCamera:FindFirstChild("ContoursBlindMan")
+	if not folder then
+		return
+	end
+	for _, h in ipairs(folder:GetChildren()) do
+		if h:IsA("Highlight") then
+			gameContours[h] = folder
+			h.Parent = nil
+		end
+	end
+end
+
+local function restoreGameContours()
+	for h, folder in pairs(gameContours) do
+		if folder.Parent then
+			pcall(function()
+				h.Parent = folder
+			end)
+		end
+		gameContours[h] = nil
+	end
+end
+
 local function clearOutlines()
 	for model, h in pairs(outlines) do
 		h:Destroy()
 		outlines[model] = nil
 	end
+	restoreGameContours()
+end
+
+local function inRoundState()
+	local etat = ReplicatedStorage:GetAttribute("Etat")
+	return etat == "EnJeu" or etat == "Intro"
+end
+
+-- Solo servers fill with bots in workspace.Bots. A bot's id is its FauxJoueur attr and the game
+-- names a bot blind man as AveugleUserId = -id; the server also sets EstBlindMan on the model.
+local function isBlindBot(bot)
+	if bot:GetAttribute("EstBlindMan") == true then
+		return true
+	end
+	local id = bot:GetAttribute("FauxJoueur")
+	if type(id) ~= "number" then
+		return false
+	end
+	return ReplicatedStorage:GetAttribute("AveugleUserId") == -id
+		or ReplicatedStorage:GetAttribute("AveugleUserId2") == -id
 end
 
 local function refreshOutlines()
 	if not outlinesOn then
 		return
 	end
+	suppressGameContours()
 	local want = {}
 	for _, p in ipairs(Players:GetPlayers()) do
 		local c = p.Character
@@ -596,10 +720,10 @@ local function refreshOutlines()
 		end
 	end
 	local bots = workspace:FindFirstChild("Bots")
-	if bots then
+	if bots and inRoundState() then
 		for _, b in ipairs(bots:GetChildren()) do
 			if b:IsA("Model") and alive(b) then
-				if b:GetAttribute("EstBlindMan") == true then
+				if isBlindBot(b) then
 					want[b] = COLOR_BLIND
 				elseif b:GetAttribute("Infecte") == true then
 					want[b] = COLOR_INFECTED
@@ -854,6 +978,177 @@ end
 track(Players.PlayerAdded:Connect(alertIfStaff))
 
 --------------------------------------------------------------------------------
+-- Anti AFK
+--------------------------------------------------------------------------------
+
+-- Two separate things:
+-- 1. Roblox's own 20-minute idle kick (a C-side Player.Idled connection). Disabled via
+--    getconnections, with a VirtualUser click on Idled as a fallback.
+-- 2. The game's "AFK MODE" (player attr AFK, AFKDepuis): the server turns it on by itself (no client
+--    script sends it) and an AFK player is not put in rounds. The settings menu turns it off with
+--    ReplicatedStorage.AFK:FireServer(false); we send the same thing when the server flips it on.
+local antiAfkOn = false
+local afkStats = { reverted = 0, idleKicks = 0 }
+local afkRemote = ReplicatedStorage:FindFirstChild("AFK")
+local disabledIdled = {}
+local onIdled
+
+local function setIdleKickBlocked(block)
+	if not getconnections then
+		return
+	end
+	if block then
+		for _, c in ipairs(getconnections(localPlayer.Idled)) do
+			if not disabledIdled[c] and c.Function ~= onIdled then
+				local ok = pcall(function()
+					c:Disable()
+				end)
+				if ok then
+					disabledIdled[c] = true
+				end
+			end
+		end
+	else
+		for c in pairs(disabledIdled) do
+			pcall(function()
+				c:Enable()
+			end)
+		end
+		disabledIdled = {}
+	end
+end
+
+function onIdled()
+	if not antiAfkOn then
+		return
+	end
+	afkStats.idleKicks += 1
+	pcall(function()
+		local vu = game:GetService("VirtualUser")
+		vu:CaptureController()
+		vu:ClickButton2(Vector2.new())
+	end)
+end
+track(localPlayer.Idled:Connect(onIdled))
+
+local lastAfkSend = 0
+local function checkAfkMode()
+	if not antiAfkOn or not afkRemote then
+		return
+	end
+	if localPlayer:GetAttribute("AFK") == true and os.clock() - lastAfkSend >= 2 then
+		lastAfkSend = os.clock()
+		afkStats.reverted += 1
+		afkRemote:FireServer(false)
+		print("[BBD] Anti AFK: server turned AFK mode on, sent AFK(false)")
+	end
+end
+
+track(localPlayer:GetAttributeChangedSignal("AFK"):Connect(function()
+	pcall(checkAfkMode)
+end))
+
+--------------------------------------------------------------------------------
+-- Anti Stim (blind man)
+--------------------------------------------------------------------------------
+
+-- Funky Stim, measured 2026-11-05: in one server step the victim gets player+character attr
+-- DanseForcee=true, a random player attr Emote, WalkSpeed 0, and the held tool moved to the Backpack.
+-- Everything clears exactly 5 s later. The dance itself is played by the victim's own Emotes script
+-- (Action-priority track on the character's Animator + a "SonEmote" Sound in SoundService), so it
+-- can be stopped here. WalkSpeed is written locally (movement is client-owned; Always Sneak showed
+-- a local WalkSpeed holds). Whether the server accepts shots while DanseForcee is on is untested.
+local SoundService = game:GetService("SoundService")
+local antiStimOn = false
+local stimStats = { blocked = 0, last = "none yet" }
+local emoteAnimIds = {}
+pcall(function()
+	for _, data in pairs(require(ReplicatedStorage:WaitForChild("EmotesData", 5))) do
+		if type(data) == "table" and data.animation then
+			emoteAnimIds[tostring(data.animation)] = true
+		end
+	end
+end)
+
+local STIM_EQUIP_RETRY = 0.4
+-- How long after a tool leaves the hand it still counts as "what you were holding".
+local STIM_TOOL_MEMORY = 0.5
+
+local stimActive = false
+local stimPreSpeed = 12
+local stimLastTool, stimLastToolAt = nil, 0
+local stimLastEquip = 0
+local stimWantTool = nil
+
+local function stopEmote(humanoid)
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+	if animator then
+		for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+			local id = track.Animation and string.match(track.Animation.AnimationId, "%d+")
+			if id and emoteAnimIds[id] then
+				track:Stop(0)
+			end
+		end
+	end
+	for _, s in ipairs(SoundService:GetChildren()) do
+		if s.Name == "SonEmote" and s:IsA("Sound") and s.IsPlaying then
+			s:Stop()
+		end
+	end
+end
+
+track(RunService.Heartbeat:Connect(function()
+	if not antiStimOn then
+		stimActive = false
+		return
+	end
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+	local forced = localPlayer:GetAttribute("DanseForcee") == true
+		or character:GetAttribute("DanseForcee") == true
+	if not forced then
+		if stimActive then
+			stimActive = false
+			stimStats.last = string.format("ended %s", os.date("%H:%M:%S"))
+		end
+		if humanoid.WalkSpeed > 0 then
+			stimPreSpeed = humanoid.WalkSpeed
+		end
+		local held = character:FindFirstChildOfClass("Tool")
+		if held then
+			stimLastTool, stimLastToolAt = held.Name, os.clock()
+		end
+		return
+	end
+	if not amBlind() then
+		return
+	end
+	if not stimActive then
+		stimActive = true
+		stimStats.blocked += 1
+		stimWantTool = (stimLastTool and os.clock() - stimLastToolAt <= STIM_TOOL_MEMORY) and stimLastTool or nil
+		stimStats.last = string.format("blocked %s, holding %s", os.date("%H:%M:%S"), tostring(stimWantTool))
+		print("[BBD] Anti Stim: Funky Stim blocked, restoring speed " .. stimPreSpeed .. " and " .. tostring(stimWantTool))
+	end
+	if humanoid.WalkSpeed < stimPreSpeed then
+		humanoid.WalkSpeed = stimPreSpeed
+	end
+	stopEmote(humanoid)
+	local wantTool = stimWantTool
+	if wantTool and not character:FindFirstChild(wantTool) and os.clock() - stimLastEquip >= STIM_EQUIP_RETRY then
+		local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+		local tool = backpack and backpack:FindFirstChild(wantTool)
+		if tool then
+			stimLastEquip = os.clock()
+			humanoid:EquipTool(tool)
+		end
+	end
+end))
+
+--------------------------------------------------------------------------------
 -- UI
 --------------------------------------------------------------------------------
 
@@ -912,6 +1207,22 @@ Tabs.Blind:AddSlider("AimFov", {
 }):OnChanged(function(v)
 	S.aimFov = v
 	fovPreviewUntil = os.clock() + FOV_PREVIEW_SECONDS
+end)
+
+Tabs.Blind:AddToggle("AntiStim", {
+	Title = "Anti Funky Stim",
+	Description = "When a hider stims you: keep walking, skip the dance, shotgun back in hand",
+	Default = pref("AntiStim", true),
+}):OnChanged(function(v)
+	antiStimOn = v
+end)
+
+Tabs.Blind:AddToggle("AntiSerum", {
+	Title = "Anti Scary Serum",
+	Description = "When a hider uses the Scary Serum: normal controls, no fake footsteps or coughs",
+	Default = pref("AntiSerum", true),
+}):OnChanged(function(v)
+	S.antiSerum = v
 end)
 
 Tabs.Hider:AddToggle("AntiPush", {
@@ -989,6 +1300,18 @@ Tabs.Misc:AddToggle("Staff", {
 	end
 end)
 
+Tabs.Misc:AddToggle("AntiAfk", {
+	Title = "Anti AFK",
+	Description = "Blocks the idle kick and turns the game's AFK mode back off so you stay in rounds",
+	Default = pref("AntiAfk", true),
+}):OnChanged(function(v)
+	antiAfkOn = v
+	setIdleKickBlocked(v)
+	if v then
+		pcall(checkAfkMode)
+	end
+end)
+
 Tabs.Misc:AddButton({
 	Title = "Unload Hub",
 	Description = "Removes the menu and turns everything off",
@@ -1038,6 +1361,9 @@ local function featureText()
 		"Anti Push: " .. (S.hookedProjection and (tostring(S.pushBlocked or 0) .. " blocked") or "not hooked"),
 		"Escape: " .. stats.escapeLast .. " (" .. stats.escapeWorked .. "/" .. stats.escapeSent .. " sends worked)",
 		"Phone: " .. stats.phoneLast .. " (" .. stats.phoneDone .. " done)",
+		"Anti Serum: " .. (not S.antiSerum and "off" or (S.hookedSerum and (tostring(S.serumFrames or 0) .. " scrambled frames, " .. tostring(S.serumNoises or 0) .. " fake noises blocked") or "not hooked")),
+		"Anti Stim: " .. (antiStimOn and (stimStats.blocked .. " blocked, " .. stimStats.last) or "off"),
+		"Anti AFK: " .. (antiAfkOn and (afkStats.reverted .. " AFK resets, " .. afkStats.idleKicks .. " idle kicks blocked") or "off"),
 	}, "\n")
 end
 
@@ -1068,6 +1394,7 @@ task.spawn(function()
 		pcall(refreshFovCircle)
 		pcall(refreshShake)
 		pcall(refreshSneak)
+		pcall(checkAfkMode)
 		if now - lastStatus >= STATUS_REFRESH then
 			lastStatus = now
 			pcall(function()
@@ -1096,7 +1423,11 @@ function Hub.cleanup()
 	S.silentAim = false
 	S.antiPush = false
 	S.antiShake = false
+	S.antiSerum = false
 	S.alwaysSneak = false
+	antiAfkOn = false
+	antiStimOn = false
+	setIdleKickBlocked(false)
 	restoreShake()
 	if S.active then
 		seeDeactivate(Lighting:FindFirstChild(BLIND_SKY_NAME) == nil)
@@ -1131,6 +1462,10 @@ task.spawn(function()
 	local shakeOk, shakeResult = pcall(hookGrabShake)
 	if not shakeOk or not shakeResult then
 		notify("Anti Shake", "Grab shake hook failed: " .. tostring(shakeResult), 8)
+	end
+	local serumOk, serumResult, serumWhy = pcall(hookScarySerum)
+	if not serumOk or not serumResult then
+		notify("Anti Scary Serum", "Hook failed: " .. tostring(serumWhy or serumResult), 8)
 	end
 end)
 notify("blind but dangerous", "Loaded. RightControl hides the menu.", 5)
