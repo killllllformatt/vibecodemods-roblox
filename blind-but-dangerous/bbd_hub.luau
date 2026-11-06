@@ -1486,6 +1486,52 @@ track(RunService.Heartbeat:Connect(function()
 end))
 
 --------------------------------------------------------------------------------
+-- Jump. The game sets StarterPlayer CharacterJumpPower/JumpHeight 0 and turns the Humanoid's
+-- Jumping state off (seen 2026-11-05: UseJumpPower true, JumpPower 0, GetStateEnabled false).
+-- Jumping is client physics, so turning both back on locally is enough. Long falls still trip
+-- the game's fall ragdoll unless Anti Fall Ragdoll is on.
+local JUMP_POWER = 50 -- Roblox default, about 7 studs high
+local jumpTouched = false
+local UserInputServiceJ = game:GetService("UserInputService")
+
+-- The game ships its own movement script, so don't rely on it reading Space: hold Space and we
+-- set Humanoid.Jump ourselves each render frame (the control script rewrites Jump per frame,
+-- like Move, so a one-off write from elsewhere is lost).
+track(RunService.RenderStepped:Connect(function()
+	if not S.jump or not UserInputServiceJ:IsKeyDown(Enum.KeyCode.Space) or UserInputServiceJ:GetFocusedTextBox() then
+		return
+	end
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if humanoid and humanoid.Health > 0 then
+		humanoid.Jump = true
+	end
+end))
+
+track(RunService.Heartbeat:Connect(function()
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+	if S.jump then
+		if not humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping) then
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+		end
+		-- 0 is also what the stim / Hearing Aids freezes write; leave those to their own features
+		if humanoid.UseJumpPower and humanoid.JumpPower > 0 and humanoid.JumpPower < JUMP_POWER then
+			humanoid.JumpPower = JUMP_POWER
+		elseif humanoid.UseJumpPower and humanoid.JumpPower == 0 and humanoid.WalkSpeed > 0 then
+			humanoid.JumpPower = JUMP_POWER
+		end
+		jumpTouched = true
+	elseif jumpTouched then
+		jumpTouched = false
+		humanoid.JumpPower = game:GetService("StarterPlayer").CharacterJumpPower
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+	end
+end))
+
 -- Auto Inject (hider). FunkySerum (Funky Stim) and ScarySerum run the same client script: hold
 -- 0.3 s on the blind man within 10 studs (kept up to 11), then FireServer(targetModel). Each tool
 -- also has a touch-screen path, BindableEvent `UtiliserTactile`:Fire(true) -> commencer(true),
@@ -1823,6 +1869,14 @@ Tabs.Blind:AddToggle("AntiSerum", {
 	Default = pref("AntiSerum", true),
 }):OnChanged(function(v)
 	S.antiSerum = v
+end)
+
+Tabs.Misc:AddToggle("Jump", {
+	Title = "Jump",
+	Description = "Lets you jump again (the game turns jumping off). Keep Anti Fall Ragdoll on so landings don't ragdoll you",
+	Default = pref("Jump", false),
+}):OnChanged(function(v)
+	S.jump = v
 end)
 
 Tabs.Misc:AddToggle("AntiPush", {
