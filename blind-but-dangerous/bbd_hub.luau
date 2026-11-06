@@ -238,12 +238,107 @@ local function hookGrabShake()
 	return false
 end
 
+-- Fall ragdoll, read from PlayerScripts.ChuteRagdoll 2026-11-05: entirely client-decided. Its
+-- Humanoid.StateChanged handler starts a timer on Freefall; a Heartbeat loop ragdolls you (state
+-- Physics + ChuteRagdoll:FireServer(true)) after 0.2 s of free fall as a hider, 0.4 s as the blind
+-- man, and keeps you down 2 s (+2 s bonus for hiders). Hooking the StateChanged closure and passing
+-- Freefall through as Landed keeps the timer nil, so the Heartbeat never fires. The closure is new for
+-- every character, so it is re-found each spawn. ForcerRagdoll (the script's BindableEvent for
+-- ragdolls from other causes) and the recovery path are untouched.
+-- Kept in S so a hub reload doesn't hook the same closure twice.
+local hookedFall = S.hookedFallSet or setmetatable({}, { __mode = "k" })
+S.hookedFallSet = hookedFall
+
+local function hookFallRagdoll()
+	if not (getconnections and hookfunction) then
+		return false
+	end
+	local ch = localPlayer.Character
+	local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+	if not hum then
+		return false
+	end
+	if hookedFall[hum] then
+		return true
+	end
+	local chute = localPlayer:WaitForChild("PlayerScripts"):FindFirstChild("ChuteRagdoll")
+	if not chute then
+		return false
+	end
+	for _, conn in ipairs(getconnections(hum.StateChanged)) do
+		local fn = conn.Function
+		local ok, env = pcall(getfenv, fn or 0)
+		if fn and ok and env and env.script == chute then
+			local landed = Enum.HumanoidStateType.Landed
+			local freefall = Enum.HumanoidStateType.Freefall
+			local old
+			old = hookfunction(fn, function(oldState, newState, ...)
+				if S.antiFall and newState == freefall then
+					S.fallBlocked = (S.fallBlocked or 0) + 1
+					return old(oldState, landed, ...)
+				end
+				return old(oldState, newState, ...)
+			end)
+			hookedFall[hum] = true
+			S.hookedFall = true
+			return true
+		end
+	end
+	return false
+end
+
 -- Scary Serum, measured 2026-11-05: the server only sets player attr FauxBruitsJusqua (now + 10 s).
 -- The rest runs in our own PlayerScripts.FauxBruits: an anonymous BindToRenderStep
 -- ("ScarySerumTouches", Input+1) re-routes MoveDirection through a random axis swap/flip with
 -- Humanoid:Move, and unBruit() plays fake footsteps/coughs (Part "FauxBruit" in the Camera) every
 -- 1.2-2.2 s. The render function has no name, so it's found by its constants. Hooks persist across
 -- reloads; S.antiSerum is read at call time.
+-- Hearing Aids heart minigame (hider side), read from PlayerScripts.AppareilAuditif 2026-11-05: when
+-- the blind man uses Hearing Aids, every hider gets a 7 s "stay calm" heart line (keep it inside
+-- +-0.45; 2 strikes of >0.12 s out on PC, or the gyro/shake variant going 0.75 s without input).
+-- Every failure path calls local finir(true), which is the ONLY place that sends
+-- AppareilAuditif:FireServer("rate") (= the blind man gets your heart position). Passing sends
+-- nothing. The hook turns finir(true) into finir(false): "YOU STAYED CALM", nothing sent.
+-- Practice mode (player attr TestCoeurJusqua) runs the same game and never sends "rate".
+local function hookHeart()
+	if S.hookedHeart then
+		return true
+	end
+	if not CAN_HOOK then
+		return false, "executor has no getgc/hookfunction"
+	end
+	local target = localPlayer:WaitForChild("PlayerScripts"):FindFirstChild("AppareilAuditif")
+	if not target then
+		return false, "AppareilAuditif script not found"
+	end
+	local finir
+	for i, f in ipairs(getgc(false)) do
+		if type(f) == "function" and islclosure(f) and debug.info(f, "n") == "finir" then
+			local ok, env = pcall(getfenv, f)
+			if ok and env and rawget(env, "script") == target then
+				finir = f
+				break
+			end
+		end
+		if i % GC_YIELD_EVERY == 0 then
+			task.wait()
+		end
+	end
+	if not finir then
+		return false, "finir not found"
+	end
+	local old
+	old = hookfunction(finir, function(failed, ...)
+		if S.autoHeart and failed then
+			S.heartSaves = (S.heartSaves or 0) + 1
+			return old(false, ...)
+		end
+		return old(failed, ...)
+	end)
+	S.hookedHeart = true
+	return true
+end
+
 local function hookScarySerum()
 	if S.hookedSerum then
 		return true
@@ -674,6 +769,55 @@ local function restoreGameContours()
 	end
 end
 
+-- HUDPartie also drops a "RepereBlindMan" Highlight (AlwaysOnTop, red fill) straight into the blind
+-- man's model the moment Etat becomes EnJeu, for 3 s (Debris). Same one-Highlight-per-adornee rule,
+-- so for hiders it replaced ours right at round start. While our outlines are on it is destroyed as it
+-- appears (its own fade checks .Parent, Debris on a destroyed instance is a no-op) and our Highlight
+-- for that model is re-adorned so Roblox picks it up again.
+local repereKilled = 0
+
+local function killRepere(h)
+	if not outlinesOn or not h:IsA("Highlight") or h.Name ~= "RepereBlindMan" then
+		return
+	end
+	local model = h.Adornee or h.Parent
+	pcall(function()
+		h:Destroy()
+	end)
+	repereKilled += 1
+	S.repereKilled = repereKilled
+	local ours = outlines[model]
+	if ours then
+		ours.Adornee = nil
+		ours.Adornee = model
+	end
+end
+
+track(workspace.DescendantAdded:Connect(function(d)
+	if d.ClassName == "Highlight" and d.Name == "RepereBlindMan" then
+		-- Name/Adornee are set before Parent in HUDPartie, but defer anyway in case that changes.
+		task.defer(killRepere, d)
+	end
+end))
+
+local function sweepRepere()
+	for _, p in ipairs(Players:GetPlayers()) do
+		local h = p.Character and p.Character:FindFirstChild("RepereBlindMan")
+		if h then
+			killRepere(h)
+		end
+	end
+	local bots = workspace:FindFirstChild("Bots")
+	if bots then
+		for _, b in ipairs(bots:GetChildren()) do
+			local h = b:FindFirstChild("RepereBlindMan")
+			if h then
+				killRepere(h)
+			end
+		end
+	end
+end
+
 local function clearOutlines()
 	for model, h in pairs(outlines) do
 		h:Destroy()
@@ -706,6 +850,7 @@ local function refreshOutlines()
 		return
 	end
 	suppressGameContours()
+	sweepRepere()
 	local want = {}
 	for _, p in ipairs(Players:GetPlayers()) do
 		local c = p.Character
@@ -1048,6 +1193,83 @@ track(localPlayer:GetAttributeChangedSignal("AFK"):Connect(function()
 	pcall(checkAfkMode)
 end))
 
+-- 3. Blind-man AFK, captured 2026-11-05: standing still for 25 s as the blind man in EnJeu makes the
+--    server set char attr BlindAFK, RS BlindAFK=userId, player AFK=true, Notification "You didn't move
+--    for 25s as the blind man", and end the round ("THE BLIND MAN WENT AFK — HIDERS WIN") in the same
+--    step, so reverting AFK afterwards is too late. The check is on position, so once the HRP has
+--    stayed within BLIND_AFK_RADIUS for BLIND_AFK_AFTER seconds we walk it a short step out and back.
+--    The server's own distance threshold is unknown; the step is several studs to be safe.
+local BLIND_AFK_AFTER = 12
+local BLIND_AFK_RADIUS = 2
+local BLIND_AFK_STEP = 0.35 -- seconds per leg at blind walk speed 12 = about 4 studs
+local blindAnchor, blindAnchorAt = nil, 0
+local nudging = false
+local nudgeDirs = { Vector3.new(0, 0, -1), Vector3.new(1, 0, 0), Vector3.new(0, 0, 1), Vector3.new(-1, 0, 0) }
+local nudgeIdx = 1
+afkStats.blindNudges = 0
+
+local function doNudge(hum, hrp)
+	nudging = true
+	afkStats.blindNudges += 1
+	local cam = workspace.CurrentCamera
+	local base = nudgeDirs[nudgeIdx]
+	nudgeIdx = nudgeIdx % #nudgeDirs + 1
+	local dir = base
+	if cam then
+		local look = cam.CFrame:VectorToWorldSpace(base)
+		dir = Vector3.new(look.X, 0, look.Z)
+		dir = dir.Magnitude > 0.01 and dir.Unit or base
+	end
+	-- Must run on RenderStepped: the game's control script re-writes Move every render frame, so a
+	-- Move from a task.wait() loop is wiped before physics (measured: 0 studs vs 6.7 studs in 0.4 s).
+	local rs = game:GetService("RunService")
+	local function leg(d)
+		local t = os.clock()
+		while os.clock() - t < BLIND_AFK_STEP and hum.Parent do
+			hum:Move(d, false)
+			rs.RenderStepped:Wait()
+		end
+	end
+	-- One leg only: end up about 4 studs away and stay there (directions cycle, so repeated nudges
+	-- walk a small square instead of drifting). Out-and-back could net zero if the server compares
+	-- against an older sample.
+	leg(dir)
+	hum:Move(Vector3.zero, false)
+	print(string.format("[BBD] Anti AFK: blind man idle %ds, nudged", BLIND_AFK_AFTER))
+	nudging = false
+end
+
+local function checkBlindAfk()
+	if not antiAfkOn or nudging then
+		return
+	end
+	local etat = ReplicatedStorage:GetAttribute("Etat")
+	local ch = localPlayer.Character
+	local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+	local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+	-- Only the named blind man (not amBlind(): in Anarchy everyone is blind and hiders stand still on
+	-- purpose; the server message says "as the blind man").
+	local uid = localPlayer.UserId
+	local isBlindMan = ReplicatedStorage:GetAttribute("AveugleUserId") == uid
+		or ReplicatedStorage:GetAttribute("AveugleUserId2") == uid
+	if etat ~= "EnJeu" or not isBlindMan or not hrp or not hum or hum.Health <= 0 then
+		blindAnchor = nil
+		return
+	end
+	local p = hrp.Position
+	local flat = Vector3.new(p.X, 0, p.Z)
+	local now = os.clock()
+	if not blindAnchor or (flat - blindAnchor).Magnitude > BLIND_AFK_RADIUS then
+		blindAnchor, blindAnchorAt = flat, now
+		return
+	end
+	if now - blindAnchorAt >= BLIND_AFK_AFTER then
+		-- Retry every 2 s if the nudge was blocked (wall) and the anchor didn't move.
+		blindAnchorAt = now - BLIND_AFK_AFTER + 2
+		task.spawn(doNudge, hum, hrp)
+	end
+end
+
 --------------------------------------------------------------------------------
 -- Anti Stim (blind man)
 --------------------------------------------------------------------------------
@@ -1233,6 +1455,14 @@ Tabs.Hider:AddToggle("AntiPush", {
 	S.antiPush = v
 end)
 
+Tabs.Hider:AddToggle("AutoHeart", {
+	Title = "Auto Calm Heart",
+	Description = "Hearing Aids minigame always passes, so the blind man never gets your heartbeat",
+	Default = pref("AutoHeart", true),
+}):OnChanged(function(v)
+	S.autoHeart = v
+end)
+
 Tabs.Hider:AddToggle("AlwaysSneak", {
 	Title = "Always Sneak",
 	Description = "Stays in sneak during rounds at normal walking speed",
@@ -1300,9 +1530,20 @@ Tabs.Misc:AddToggle("Staff", {
 	end
 end)
 
+Tabs.Misc:AddToggle("AntiFall", {
+	Title = "Anti Fall Ragdoll",
+	Description = "No ragdoll from falling or long jumps (both roles). Pushes still work as usual unless Anti Push is on",
+	Default = pref("AntiFall", true),
+}):OnChanged(function(v)
+	S.antiFall = v
+	if v then
+		pcall(hookFallRagdoll)
+	end
+end)
+
 Tabs.Misc:AddToggle("AntiAfk", {
 	Title = "Anti AFK",
-	Description = "Blocks the idle kick and turns the game's AFK mode back off so you stay in rounds",
+	Description = "Blocks the idle kick, turns the game's AFK mode back off, and steps you a few studs if you stand still 12 s as the blind man (the server ends the round at 25 s)",
 	Default = pref("AntiAfk", true),
 }):OnChanged(function(v)
 	antiAfkOn = v
@@ -1363,7 +1604,9 @@ local function featureText()
 		"Phone: " .. stats.phoneLast .. " (" .. stats.phoneDone .. " done)",
 		"Anti Serum: " .. (not S.antiSerum and "off" or (S.hookedSerum and (tostring(S.serumFrames or 0) .. " scrambled frames, " .. tostring(S.serumNoises or 0) .. " fake noises blocked") or "not hooked")),
 		"Anti Stim: " .. (antiStimOn and (stimStats.blocked .. " blocked, " .. stimStats.last) or "off"),
-		"Anti AFK: " .. (antiAfkOn and (afkStats.reverted .. " AFK resets, " .. afkStats.idleKicks .. " idle kicks blocked") or "off"),
+		"Auto Calm Heart: " .. (S.autoHeart and ((S.hookedHeart and "hooked, " or "NOT hooked, ") .. (S.heartSaves or 0) .. " fails turned into passes") or "off"),
+		"Anti Fall Ragdoll: " .. (S.antiFall and ((S.hookedFall and "hooked, " or "not hooked yet, ") .. (S.fallBlocked or 0) .. " falls ignored") or "off"),
+		"Anti AFK: " .. (antiAfkOn and (afkStats.reverted .. " AFK resets, " .. afkStats.idleKicks .. " idle kicks blocked, " .. afkStats.blindNudges .. " blind nudges") or "off"),
 	}, "\n")
 end
 
@@ -1395,6 +1638,10 @@ task.spawn(function()
 		pcall(refreshShake)
 		pcall(refreshSneak)
 		pcall(checkAfkMode)
+		pcall(checkBlindAfk)
+		if S.antiFall then
+			pcall(hookFallRagdoll)
+		end
 		if now - lastStatus >= STATUS_REFRESH then
 			lastStatus = now
 			pcall(function()
@@ -1466,6 +1713,10 @@ task.spawn(function()
 	local serumOk, serumResult, serumWhy = pcall(hookScarySerum)
 	if not serumOk or not serumResult then
 		notify("Anti Scary Serum", "Hook failed: " .. tostring(serumWhy or serumResult), 8)
+	end
+	local heartOk, heartResult, heartWhy = pcall(hookHeart)
+	if not heartOk or not heartResult then
+		notify("Auto Calm Heart", "Hook failed: " .. tostring(heartWhy or heartResult), 8)
 	end
 end)
 notify("blind but dangerous", "Loaded. RightControl hides the menu.", 5)
