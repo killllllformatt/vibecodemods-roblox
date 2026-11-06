@@ -301,7 +301,7 @@ end
 -- nothing. The hook turns finir(true) into finir(false): "YOU STAYED CALM", nothing sent.
 -- Practice mode (player attr TestCoeurJusqua) runs the same game and never sends "rate".
 local function hookHeart()
-	if S.hookedHeart then
+	if S.hookedHeart and S.hookedLancer then
 		return true
 	end
 	if not CAN_HOOK then
@@ -311,13 +311,22 @@ local function hookHeart()
 	if not target then
 		return false, "AppareilAuditif script not found"
 	end
-	local finir
+	local finir, lancer
 	for i, f in ipairs(getgc(false)) do
-		if type(f) == "function" and islclosure(f) and debug.info(f, "n") == "finir" then
-			local ok, env = pcall(getfenv, f)
-			if ok and env and rawget(env, "script") == target then
-				finir = f
-				break
+		if type(f) == "function" and islclosure(f) then
+			local name = debug.info(f, "n")
+			if name == "finir" or name == "lancer" then
+				local ok, env = pcall(getfenv, f)
+				if ok and env and rawget(env, "script") == target then
+					if name == "finir" then
+						finir = f
+					else
+						lancer = f
+					end
+					if finir and lancer then
+						break
+					end
+				end
 			end
 		end
 		if i % GC_YIELD_EVERY == 0 then
@@ -326,6 +335,22 @@ local function hookHeart()
 	end
 	if not finir then
 		return false, "finir not found"
+	end
+	-- lancer() opens the whole minigame (black screen, heart line, input capture). Skipping it means
+	-- the screen never appears and finir is never reached, so nothing is sent either way.
+	if lancer and not S.hookedLancer then
+		local oldLancer
+		oldLancer = hookfunction(lancer, function(...)
+			if S.autoHeart then
+				S.heartHidden = (S.heartHidden or 0) + 1
+				return
+			end
+			return oldLancer(...)
+		end)
+		S.hookedLancer = true
+	end
+	if S.hookedHeart then
+		return true -- finir already hooked by an earlier load
 	end
 	local old
 	old = hookfunction(finir, function(failed, ...)
@@ -449,6 +474,32 @@ end
 -- Runs the game's tirer steps with a chosen direction and never touches the camera. Works on
 -- tirer's own upvalues: 1 tool, 2 last-shot clock, 3 player, 4 VRUtil, 5 TirFusil, 6 petitRecul,
 -- 7 recul. Returns false to let the real tirer run if any of them don't look right, or in VR.
+-- Measured 2026-11-05: the server's pellet origin (TirFusil reply arg 1) is the shotgun's
+-- Handle.Bouche attachment, matching the client's WorldPosition to 0.002 studs. It sits about 4.6
+-- studs from the root, so aiming from the root was ~10 deg off at 10 studs.
+-- BUT: muzzle-aimed shots drew pellets straight through targets (9/9 crossing) with 0 damage, 4 of
+-- 4 times, while camera- and root-aimed shots killed. So the hit check apparently runs from the
+-- head/camera along the sent direction and the muzzle is only where the visible pellets start. Aim
+-- from the head (the game itself sends the camera LookVector). Head vs muzzle A/B still to confirm.
+local function shotOrigin()
+	local ch = localPlayer.Character
+	local head = ch and ch:FindFirstChild("Head")
+	if head and head:IsA("BasePart") then
+		return head.Position
+	end
+	local root = ch and ch:FindFirstChild("HumanoidRootPart")
+	return root and root.Position or workspace.CurrentCamera.CFrame.Position
+end
+
+-- Where the server's reply says the visible pellets start, for the pellet-angle log only.
+local function muzzleOrigin()
+	local ch = localPlayer.Character
+	local tool = ch and ch:FindFirstChild("FusilAPompe")
+	local handle = tool and tool:FindFirstChild("Handle")
+	local muzzle = handle and handle:FindFirstChild("Bouche")
+	return muzzle and muzzle:IsA("Attachment") and muzzle.WorldPosition or shotOrigin()
+end
+
 local function fireSilent(tirer, aimPoint)
 	if not (debug.getupvalue and debug.setupvalue) then
 		return false
@@ -478,7 +529,8 @@ local function fireSilent(tirer, aimPoint)
 	localPlayer:SetAttribute("PretA_FusilAPompe", os.clock() + cooldown)
 	local lastShell = not isOwnerGun and shells <= 1
 	localPlayer:SetAttribute("TirViewmodel", (lastShell and "dernier:" or "tir:") .. os.clock())
-	remote:FireServer((aimPoint - workspace.CurrentCamera.CFrame.Position).Unit, nil)
+	-- Measured 2026-11-05: the server honours the sent direction (9 pellets within ~9 deg of it).
+	remote:FireServer((aimPoint - shotOrigin()).Unit, nil)
 	S.silentShots = (S.silentShots or 0) + 1
 	if isOwnerGun then
 		smallRecoil()
@@ -486,6 +538,67 @@ local function fireSilent(tirer, aimPoint)
 		recoil(nil)
 	end
 	return true
+end
+
+-- The server answers a shot with TirFusil(shooter?, {pellet endpoints}). For our redirected shots,
+-- measure each pellet's angle from the target direction vs from where the camera really looked: if
+-- the server honours the sent direction the pellets cluster around the target.
+local function angleDeg(a, b)
+	if a.Magnitude < 1e-3 or b.Magnitude < 1e-3 then
+		return 180
+	end
+	return math.deg(math.acos(math.clamp(a.Unit:Dot(b.Unit), -1, 1)))
+end
+
+local tirRemote = ReplicatedStorage:FindFirstChild("TirFusil")
+if tirRemote then
+	track(tirRemote.OnClientEvent:Connect(function(from, ends)
+		local e = S.aimPending
+		if not e or os.clock() - e.t > 1.5 or type(ends) ~= "table" then
+			return
+		end
+		S.aimPending = nil
+		-- Pellets start at the reply's origin (the muzzle); compare their directions to the one we sent.
+		local o = typeof(from) == "Vector3" and from or e.origin
+		local sumT, n = 0, 0
+		for _, p in ipairs(ends) do
+			if typeof(p) == "Vector3" then
+				sumT += angleDeg(p - o, e.dir)
+				n += 1
+			end
+		end
+		if n > 0 then
+			e.result = string.format("%d pellets, avg %.1f deg from the sent direction (target was %.1f deg off camera look)",
+				n, sumT / n, angleDeg(e.aim - e.origin, e.look))
+			S.aimShotLast = e.why .. "; " .. e.result
+		end
+	end))
+end
+
+S.silentHandler = function(old, ...)
+	local aimPoint = S.silentAim and S.pickTarget and S.pickTarget()
+	local log = S.aimLog or {}
+	S.aimLog = log
+	local entry = { t = os.clock(), why = S.silentAim and S.aimLast or "silent aim off" }
+	if #log >= 40 then
+		table.remove(log, 1)
+	end
+	log[#log + 1] = entry
+	if aimPoint and fireSilent(old, aimPoint) then
+		entry.sent = true
+		entry.aim = aimPoint
+		entry.origin = shotOrigin()
+		entry.dir = (aimPoint - entry.origin).Unit
+		entry.look = workspace.CurrentCamera.CFrame.LookVector
+		S.aimPending = entry
+		S.aimShotLast = entry.why
+		return
+	end
+	if aimPoint then
+		entry.why = entry.why .. " (fell back: " .. tostring(stats.recoilLast) .. ")"
+	end
+	S.aimShotLast = entry.why
+	return old(...)
 end
 
 local function hookRecoil(clientScript)
@@ -506,11 +619,14 @@ local function hookRecoil(clientScript)
 	end
 	if not S.hookedTirer[found.tirer] then
 		local old
+		-- The wrapper only forwards to S.silentHandler, so a hub reload changes behaviour on the
+		-- shotgun already in hand instead of waiting for the next round's tool.
 		old = hookfunction(found.tirer, function(...)
-			local aimPoint = S.silentAim and S.pickTarget and S.pickTarget()
-			if not aimPoint or not fireSilent(old, aimPoint) then
-				return old(...)
+			local handler = S.silentHandler
+			if handler then
+				return handler(old, ...)
 			end
+			return old(...)
 		end)
 		S.hookedTirer[found.tirer] = true
 	end
@@ -527,11 +643,45 @@ local function isValidAimTarget(model, isInfected, isBlind)
 	return true
 end
 
-local function aimPartOf(model)
-	return model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso") or model:FindFirstChild("HumanoidRootPart")
+-- Aim points in order of preference: torso first (largest hitbox for pellets), then head, then root.
+local function aimPartsOf(model)
+	local list = {}
+	for _, name in ipairs({ "Torso", "UpperTorso", "Head", "HumanoidRootPart" }) do
+		local p = model:FindFirstChild(name)
+		if p and p:IsA("BasePart") then
+			list[#list + 1] = p
+		end
+	end
+	return list
+end
+
+-- Line of sight from the camera, looking past parts a shot would plausibly pass: invisible ones
+-- (Transparency >= 0.95) and anything inside another character's model. Returns nil when clear, else
+-- the blocking part. Webs are skipped by RespectCanCollide.
+local LOS_PASSES = 6
+local function losBlocker(origin, target, ignore)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.RespectCanCollide = true
+	local list = table.clone(ignore)
+	for _ = 1, LOS_PASSES do
+		params.FilterDescendantsInstances = list
+		local hit = workspace:Raycast(origin, target - origin, params)
+		if not hit then
+			return nil
+		end
+		local inst = hit.Instance
+		if inst.Transparency >= 0.95 then
+			list[#list + 1] = inst
+		else
+			return inst
+		end
+	end
+	return nil
 end
 
 -- The target nearest the crosshair inside the FOV, with a clear line from the camera.
+-- Every call leaves a one-line reason in S.aimLast so a miss can be explained.
 function S.pickTarget()
 	local camera = workspace.CurrentCamera
 	local center = camera.ViewportSize / 2
@@ -552,26 +702,45 @@ function S.pickTarget()
 			end
 		end
 	end
-	local best, bestDist = nil, S.aimFov or AIM_FOV_DEFAULT
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	-- Halloween web sheets are invisible, non-collidable and queryable, up to about 37 studs across.
-	params.RespectCanCollide = true
+	local fov = S.aimFov or AIM_FOV_DEFAULT
+	local best, bestDist, bestName = nil, fov, nil
+	-- LOS from the head (where the hit check appears to start), not the camera, which can sit behind walls.
+	local origin = shotOrigin()
+	local nearestOut, blockedBy = math.huge, nil
+	-- Characters (ours, the target's, and everyone else's) never count as cover for the LOS check.
+	local ignore = { camera, localPlayer.Character }
 	for _, model in ipairs(candidates) do
-		local part = aimPartOf(model)
-		if part then
+		ignore[#ignore + 1] = model
+	end
+	for _, model in ipairs(candidates) do
+		for _, part in ipairs(aimPartsOf(model)) do
 			local screen, onScreen = camera:WorldToViewportPoint(part.Position)
-			if onScreen then
+			if onScreen and screen.Z > 0 then
 				local dist = (Vector2.new(screen.X, screen.Y) - center).Magnitude
 				if dist < bestDist then
-					params.FilterDescendantsInstances = { localPlayer.Character, camera, model }
-					local origin = camera.CFrame.Position
-					if not workspace:Raycast(origin, part.Position - origin, params) then
-						best, bestDist = part.Position, dist
+					local blocker = losBlocker(origin, part.Position, ignore)
+					if not blocker then
+						best, bestDist, bestName = part.Position, dist, model.Name .. "." .. part.Name
+						break -- first visible part of this model wins
+					else
+						blockedBy = blocker:GetFullName()
 					end
+				elseif dist < nearestOut then
+					nearestOut = dist
 				end
 			end
 		end
+	end
+	if best then
+		S.aimLast = string.format("target %s, %.0f px from crosshair", bestName, bestDist)
+	elseif #candidates == 0 then
+		S.aimLast = "no target: no live hiders"
+	elseif blockedBy then
+		S.aimLast = "no target: line of sight blocked by " .. blockedBy
+	elseif nearestOut < math.huge then
+		S.aimLast = string.format("no target: nearest is %.0f px away, FOV is %d", nearestOut, fov)
+	else
+		S.aimLast = "no target: nobody on screen"
 	end
 	return best
 end
@@ -1270,6 +1439,43 @@ local function checkBlindAfk()
 	end
 end
 
+-- Hearing Aids freeze (hider side). Measured 2026-11-05: when the blind man uses them the server
+-- sets RS EcouteActiveJusqua = now + 7 s and every Humanoid's WalkSpeed to 0 (it comes back after
+-- ~7.06 s). Nothing in our client freezes us, so the server's replicated 0 is simply overwritten
+-- locally with the speed we had just before (movement is client-owned, as with Anti Funky Stim).
+-- Also undoes the blind man's own freeze while he listens (unadvertised perk of the same toggle).
+local hearPre = { WalkSpeed = nil, JumpPower = nil, JumpHeight = nil }
+local hearActive = false
+
+track(RunService.Heartbeat:Connect(function()
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+	local listening = (ReplicatedStorage:GetAttribute("EcouteActiveJusqua") or 0) > workspace:GetServerTimeNow()
+	if not (S.autoHeart and listening) then
+		hearActive = false
+		for prop in pairs(hearPre) do
+			local v = humanoid[prop]
+			if v > 0 then
+				hearPre[prop] = v
+			end
+		end
+		return
+	end
+	if not hearActive then
+		hearActive = true
+		S.hearFreezes = (S.hearFreezes or 0) + 1
+	end
+	for prop, v in pairs(hearPre) do
+		if v and humanoid[prop] == 0 then
+			humanoid[prop] = v
+			S.hearRestores = (S.hearRestores or 0) + 1
+		end
+	end
+end))
+
 --------------------------------------------------------------------------------
 -- Anti Stim (blind man)
 --------------------------------------------------------------------------------
@@ -1447,7 +1653,7 @@ Tabs.Blind:AddToggle("AntiSerum", {
 	S.antiSerum = v
 end)
 
-Tabs.Hider:AddToggle("AntiPush", {
+Tabs.Misc:AddToggle("AntiPush", {
 	Title = "Anti Push",
 	Description = "Ignores the fling and ragdoll when someone pushes you",
 	Default = pref("AntiPush", false),
@@ -1456,8 +1662,8 @@ Tabs.Hider:AddToggle("AntiPush", {
 end)
 
 Tabs.Hider:AddToggle("AutoHeart", {
-	Title = "Auto Calm Heart",
-	Description = "Hearing Aids minigame always passes, so the blind man never gets your heartbeat",
+	Title = "Anti Hearing Aids",
+	Description = "When the blind man uses Hearing Aids: no heart minigame screen, no freeze, and he never gets your heartbeat",
 	Default = pref("AutoHeart", true),
 }):OnChanged(function(v)
 	S.autoHeart = v
@@ -1599,12 +1805,13 @@ local function featureText()
 		"Hide hook: " .. (S.hooked and ("installed, " .. S.calls .. " calls") or "not installed, may flicker"),
 		"Shotgun: " .. stats.recoilLast .. ", " .. tostring(S.recoilSkipped or 0) .. " recoils skipped, "
 			.. tostring(S.silentShots or 0) .. " silent shots",
+		"Silent Aim last shot: " .. tostring(S.aimShotLast or "none yet"),
 		"Anti Push: " .. (S.hookedProjection and (tostring(S.pushBlocked or 0) .. " blocked") or "not hooked"),
 		"Escape: " .. stats.escapeLast .. " (" .. stats.escapeWorked .. "/" .. stats.escapeSent .. " sends worked)",
 		"Phone: " .. stats.phoneLast .. " (" .. stats.phoneDone .. " done)",
 		"Anti Serum: " .. (not S.antiSerum and "off" or (S.hookedSerum and (tostring(S.serumFrames or 0) .. " scrambled frames, " .. tostring(S.serumNoises or 0) .. " fake noises blocked") or "not hooked")),
 		"Anti Stim: " .. (antiStimOn and (stimStats.blocked .. " blocked, " .. stimStats.last) or "off"),
-		"Auto Calm Heart: " .. (S.autoHeart and ((S.hookedHeart and "hooked, " or "NOT hooked, ") .. (S.heartSaves or 0) .. " fails turned into passes") or "off"),
+		"Anti Hearing Aids: " .. (S.autoHeart and ((S.hookedHeart and "hooked, " or "NOT hooked, ") .. (S.heartHidden or 0) .. " screens hidden, " .. (S.hearFreezes or 0) .. " freezes undone, " .. (S.heartSaves or 0) .. " fails turned into passes") or "off"),
 		"Anti Fall Ragdoll: " .. (S.antiFall and ((S.hookedFall and "hooked, " or "not hooked yet, ") .. (S.fallBlocked or 0) .. " falls ignored") or "off"),
 		"Anti AFK: " .. (antiAfkOn and (afkStats.reverted .. " AFK resets, " .. afkStats.idleKicks .. " idle kicks blocked, " .. afkStats.blindNudges .. " blind nudges") or "off"),
 	}, "\n")
@@ -1716,7 +1923,7 @@ task.spawn(function()
 	end
 	local heartOk, heartResult, heartWhy = pcall(hookHeart)
 	if not heartOk or not heartResult then
-		notify("Auto Calm Heart", "Hook failed: " .. tostring(heartWhy or heartResult), 8)
+		notify("Anti Hearing Aids", "Hook failed: " .. tostring(heartWhy or heartResult), 8)
 	end
 end)
 notify("blind but dangerous", "Loaded. RightControl hides the menu.", 5)
