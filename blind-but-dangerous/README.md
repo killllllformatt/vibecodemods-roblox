@@ -31,6 +31,7 @@ Press **RightCtrl** to open or close the menu. Running the script again unloads 
 
 **Misc**
 - Player Outlines: draws players and bots through walls. Red is the blind man or infected, white is a hider. Takes over from the game's own blind-man outline, which only shows him when he's in plain view, and from the red flash on the blind man at round start.
+- Jump: lets you jump again (the game turns jumping off). Keep Anti Fall Ragdoll on, or landings ragdoll you.
 - Anti Push: ignores the fling and ragdoll when someone pushes you, as either role.
 - Anti Fall Ragdoll: no ragdoll from falling or long jumps, as either role.
 - Anti AFK: blocks Roblox's idle kick and turns the game's AFK mode back off when the server switches it on, so you keep getting put in rounds. As the blind man it also steps you a few studs after 12 seconds standing still, because the server ends the round if the blind man doesn't move for 25 seconds.
