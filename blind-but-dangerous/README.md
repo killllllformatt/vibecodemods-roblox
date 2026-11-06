@@ -23,6 +23,9 @@ Press **RightCtrl** to open or close the menu. Running the script again unloads 
 - Always Sneak: stays in sneak during rounds at normal walking speed. You still make some noise, but much less than walking.
 - Anti Screen Shake: removes shake from the blind man, gunshots, the megaphone, grabs and firecrackers. Firecracker blur, tint and deafness still play.
 - Anti Hearing Aids: when the blind man uses Hearing Aids, the heart minigame never shows up, you don't get frozen, and he never gets your heartbeat.
+- Auto Inject: uses your Funky Stim or Scary Serum on the blind man as soon as he's within range and it's off cooldown, then puts your previous item back. Keeps going every cooldown while it's on.
+  - Teleport to Inject: no range limit. Teleports you behind the blind man for the injection (the server only accepts about 11 studs). Only acts when you have a serum or stim ready.
+  - Teleport Back After: returns you to where you were afterwards (on by default).
 - Auto Grab Escape: breaks free of grabs without mashing, about 2.5 seconds in.
 - Auto Phone Popup: completes the phone popup for you. **Untested in a real round**, so it may be ignored.
 

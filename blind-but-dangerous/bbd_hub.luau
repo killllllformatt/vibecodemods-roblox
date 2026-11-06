@@ -1444,8 +1444,12 @@ end
 -- ~7.06 s). Nothing in our client freezes us, so the server's replicated 0 is simply overwritten
 -- locally with the speed we had just before (movement is client-owned, as with Anti Funky Stim).
 -- Also undoes the blind man's own freeze while he listens (unadvertised perk of the same toggle).
-local hearPre = { WalkSpeed = nil, JumpPower = nil, JumpHeight = nil }
+-- Keys listed separately: a table literal with nil values is empty, so pairs() over it never runs
+-- (the first version restored nothing because of that).
+local HEAR_PROPS = { "WalkSpeed", "JumpPower", "JumpHeight" }
+local hearPre = {}
 local hearActive = false
+local hearRestored = false
 
 track(RunService.Heartbeat:Connect(function()
 	local character = localPlayer.Character
@@ -1456,7 +1460,8 @@ track(RunService.Heartbeat:Connect(function()
 	local listening = (ReplicatedStorage:GetAttribute("EcouteActiveJusqua") or 0) > workspace:GetServerTimeNow()
 	if not (S.autoHeart and listening) then
 		hearActive = false
-		for prop in pairs(hearPre) do
+		hearRestored = false
+		for _, prop in ipairs(HEAR_PROPS) do
 			local v = humanoid[prop]
 			if v > 0 then
 				hearPre[prop] = v
@@ -1468,15 +1473,182 @@ track(RunService.Heartbeat:Connect(function()
 		hearActive = true
 		S.hearFreezes = (S.hearFreezes or 0) + 1
 	end
-	for prop, v in pairs(hearPre) do
+	for _, prop in ipairs(HEAR_PROPS) do
+		local v = hearPre[prop]
 		if v and humanoid[prop] == 0 then
 			humanoid[prop] = v
-			S.hearRestores = (S.hearRestores or 0) + 1
+			if not hearRestored then
+				hearRestored = true
+				S.hearRestores = (S.hearRestores or 0) + 1
+			end
 		end
 	end
 end))
 
 --------------------------------------------------------------------------------
+-- Auto Inject (hider). FunkySerum (Funky Stim) and ScarySerum run the same client script: hold
+-- 0.3 s on the blind man within 10 studs (kept up to 11), then FireServer(targetModel). Each tool
+-- also has a touch-screen path, BindableEvent `UtiliserTactile`:Fire(true) -> commencer(true),
+-- which picks the nearest blind man itself with no aiming. We equip the serum, fire that, and
+-- let the game do the hold, the remote and the unequip, then put the previous tool back.
+local INJECT_TOOLS = {
+	{ name = "FunkySerum", cooldown = "SerumDispo", label = "Funky Stim" },
+	{ name = "ScarySerum", cooldown = "ScarySerumDispo", label = "Scary Serum" },
+}
+local INJECT_RANGE = 9 -- game allows 10 to start; margin for movement during the 0.3 s hold
+local injectBusy = false
+local injectNextTry = 0
+
+-- Nearest blind man (named blind, infected in the round, or blind bot): model, distance.
+local function injectTarget()
+	local root = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return nil, math.huge
+	end
+	local best, bestModel = math.huge, nil
+	local function test(model)
+		local r = model and model:FindFirstChild("HumanoidRootPart")
+		if r and alive(model) then
+			local d = (r.Position - root.Position).Magnitude
+			if d < best then
+				best, bestModel = d, model
+			end
+		end
+	end
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= localPlayer and (isBlindPlayer(p) or (p:GetAttribute("Infecte") == true and p:GetAttribute("EnManche") == true)) then
+			test(p.Character)
+		end
+	end
+	local bots = workspace:FindFirstChild("Bots")
+	if bots then
+		for _, b in ipairs(bots:GetChildren()) do
+			if b:IsA("Model") and isBlindBot(b) then
+				test(b)
+			end
+		end
+	end
+	return bestModel, best
+end
+
+local function readyInjectTool()
+	local now = workspace:GetServerTimeNow()
+	local character = localPlayer.Character
+	local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+	for _, info in ipairs(INJECT_TOOLS) do
+		if (localPlayer:GetAttribute(info.cooldown) or 0) <= now then
+			local tool = (character and character:FindFirstChild(info.name)) or (backpack and backpack:FindFirstChild(info.name))
+			if tool and tool:IsA("Tool") and tool:FindFirstChild("UtiliserTactile") then
+				return tool, info
+			end
+		end
+	end
+end
+
+-- Teleport mode: stand 3 studs behind the target and stay pinned there through the 0.3 s hold
+-- (the server only accepts injections within ~11 studs; measured 2026-11-05, 12.0 rejected,
+-- 10.5 accepted), then optionally go back to where we were.
+local function doInject(tool, info, target, teleport)
+	injectBusy = true
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local home = root and root.CFrame
+	local pin
+	local function unpin()
+		if pin then
+			pin:Disconnect()
+			pin = nil
+		end
+	end
+	local ok, err = pcall(function()
+		if teleport and root and target then
+			local function place()
+				local tr = target.Parent and target:FindFirstChild("HumanoidRootPart")
+				if tr and root.Parent then
+					root.CFrame = tr.CFrame * CFrame.new(0, 0, 3)
+					root.AssemblyLinearVelocity = Vector3.zero
+				end
+			end
+			place()
+			pin = RunService.Heartbeat:Connect(place)
+		end
+		if not humanoid then
+			return
+		end
+		local previous = character:FindFirstChildOfClass("Tool")
+		if previous == tool then
+			previous = nil
+		end
+		if tool.Parent ~= character then
+			humanoid:EquipTool(tool)
+			local t = os.clock()
+			while tool.Parent ~= character and os.clock() - t < 0.5 do
+				RunService.Heartbeat:Wait()
+			end
+			RunService.Heartbeat:Wait() -- let the tool's Equipped handler run first
+		end
+		if tool.Parent ~= character then
+			S.injectLast = info.label .. ": could not equip"
+			return
+		end
+		tool.UtiliserTactile:Fire(true)
+		local t = os.clock()
+		RunService.Heartbeat:Wait()
+		while localPlayer:GetAttribute("UtilisationObjet") == "en_cours" and os.clock() - t < 1.2 do
+			RunService.Heartbeat:Wait()
+		end
+		local state = localPlayer:GetAttribute("UtilisationObjet")
+		unpin()
+		if teleport and home and S.injectTpBack and root.Parent then
+			root.CFrame = home
+			root.AssemblyLinearVelocity = Vector3.zero
+		end
+		S.injectTries = (S.injectTries or 0) + 1
+		if state == "reussie" then
+			S.injectSent = (S.injectSent or 0) + 1
+			S.injectLast = info.label .. ": sent"
+		else
+			S.injectLast = info.label .. ": cancelled (" .. tostring(state) .. ")"
+		end
+		task.wait(0.7) -- the game unequips the serum 0.5 s after the server's "reussi"
+		if previous and previous.Parent and previous.Parent:IsA("Backpack") and humanoid.Parent and alive(character) then
+			humanoid:EquipTool(previous)
+		end
+	end)
+	unpin()
+	if not ok then
+		S.injectLast = "error: " .. tostring(err)
+	end
+	injectNextTry = os.clock() + (teleport and 3 or 1.5)
+	injectBusy = false
+end
+
+track(RunService.Heartbeat:Connect(function()
+	if not S.autoInject or injectBusy or os.clock() < injectNextTry then
+		return
+	end
+	if ReplicatedStorage:GetAttribute("Etat") ~= "EnJeu" or amBlind() or localPlayer:GetAttribute("EnManche") ~= true then
+		return
+	end
+	if not (localPlayer.Character and alive(localPlayer.Character)) then
+		return
+	end
+	local tool, info = readyInjectTool()
+	if not tool then
+		return -- no serum/stim, or both on cooldown; picks up again once one is ready
+	end
+	local target, dist = injectTarget()
+	if not target then
+		return
+	end
+	local teleport = S.injectTp and dist > INJECT_RANGE
+	if dist > INJECT_RANGE and not teleport then
+		return
+	end
+	task.spawn(doInject, tool, info, target, teleport)
+end))
+
 -- Anti Stim (blind man)
 --------------------------------------------------------------------------------
 
@@ -1669,6 +1841,30 @@ Tabs.Hider:AddToggle("AutoHeart", {
 	S.autoHeart = v
 end)
 
+Tabs.Hider:AddToggle("AutoInject", {
+	Title = "Auto Inject",
+	Description = "Uses your Funky Stim or Scary Serum on the blind man as soon as he's within range and it's off cooldown",
+	Default = pref("AutoInject", false),
+}):OnChanged(function(v)
+	S.autoInject = v
+end)
+
+Tabs.Hider:AddToggle("InjectTp", {
+	Title = "Teleport to Inject",
+	Description = "Auto Inject teleports you to the blind man from any distance. Only when you have a serum or stim off cooldown",
+	Default = pref("InjectTp", false),
+}):OnChanged(function(v)
+	S.injectTp = v
+end)
+
+Tabs.Hider:AddToggle("InjectTpBack", {
+	Title = "Teleport Back After",
+	Description = "After a teleport injection, go back to where you were",
+	Default = pref("InjectTpBack", true),
+}):OnChanged(function(v)
+	S.injectTpBack = v
+end)
+
 Tabs.Hider:AddToggle("AlwaysSneak", {
 	Title = "Always Sneak",
 	Description = "Stays in sneak during rounds at normal walking speed",
@@ -1811,6 +2007,7 @@ local function featureText()
 		"Phone: " .. stats.phoneLast .. " (" .. stats.phoneDone .. " done)",
 		"Anti Serum: " .. (not S.antiSerum and "off" or (S.hookedSerum and (tostring(S.serumFrames or 0) .. " scrambled frames, " .. tostring(S.serumNoises or 0) .. " fake noises blocked") or "not hooked")),
 		"Anti Stim: " .. (antiStimOn and (stimStats.blocked .. " blocked, " .. stimStats.last) or "off"),
+		"Auto Inject: " .. (S.autoInject and ((S.injectSent or 0) .. " sent of " .. (S.injectTries or 0) .. " tries" .. (S.injectLast and (", last: " .. S.injectLast) or "")) or "off"),
 		"Anti Hearing Aids: " .. (S.autoHeart and ((S.hookedHeart and "hooked, " or "NOT hooked, ") .. (S.heartHidden or 0) .. " screens hidden, " .. (S.hearFreezes or 0) .. " freezes undone, " .. (S.heartSaves or 0) .. " fails turned into passes") or "off"),
 		"Anti Fall Ragdoll: " .. (S.antiFall and ((S.hookedFall and "hooked, " or "not hooked yet, ") .. (S.fallBlocked or 0) .. " falls ignored") or "off"),
 		"Anti AFK: " .. (antiAfkOn and (afkStats.reverted .. " AFK resets, " .. afkStats.idleKicks .. " idle kicks blocked, " .. afkStats.blindNudges .. " blind nudges") or "off"),
