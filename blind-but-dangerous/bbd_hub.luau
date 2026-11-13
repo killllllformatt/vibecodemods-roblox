@@ -364,6 +364,39 @@ local function hookHeart()
 	return true
 end
 
+-- Night Vision blackout, captured 2026-11-12: blind man's Night Vision sets RS attr Blackout=true for
+-- 15 s. Every in-round hider's own VisionAveugle then runs t_3.appliquer(): midnight lighting, black
+-- fog 1.5-7 studs, Sky/Atmosphere/Clouds unparented, map Lights off, Neon -> SmoothPlastic.
+-- t_3.retirer() restores everything it saved. Hooking appliquer to a no-op stops all of it;
+-- retirer is called when the toggle is switched on mid-blackout. Both found by debug name + script.
+local function hookBlackout()
+	if S.hookedBlackout then
+		return true
+	end
+	if not CAN_HOOK then
+		return false, "executor has no getgc/hookfunction"
+	end
+	local vision = localPlayer:WaitForChild("PlayerScripts"):FindFirstChild("VisionAveugle")
+	if not vision then
+		return false, "VisionAveugle not found"
+	end
+	local found = findClosures({ appliquer = vision, retirer = vision })
+	if not found.appliquer then
+		return false, "appliquer not found"
+	end
+	S.blackoutRetirer = found.retirer
+	local old
+	old = hookfunction(found.appliquer, function(...)
+		if S.antiBlackout then
+			S.blackoutBlocked = (S.blackoutBlocked or 0) + 1
+			return
+		end
+		return old(...)
+	end)
+	S.hookedBlackout = true
+	return true
+end
+
 local function hookScarySerum()
 	if S.hookedSerum then
 		return true
@@ -1182,6 +1215,268 @@ local function refreshSneak()
 	end
 end
 
+do -- Trap ESP + trap actions (scoped to stay under Luau's 200-local limit)
+--------------------------------------------------------------------------------
+-- Trap ESP (2026-11-12). Blind man's bear traps live in workspace.PiegesOurs (models PiegeOurs, attr
+-- Etat "arme" = armed, "ferme" = closed on someone). Hiders normally only see a trap once someone is
+-- caught; this outlines every armed one through walls.
+--------------------------------------------------------------------------------
+
+local TRAP_COLOR = Color3.fromRGB(255, 140, 30)
+local TRAP_CAUGHT_COLOR = Color3.fromRGB(255, 40, 40)
+local trapLights = {}
+local trapAcc = 0
+S.trapsShown = 0
+
+local function clearTraps()
+	for model, h in pairs(trapLights) do
+		h:Destroy()
+		trapLights[model] = nil
+	end
+	S.trapsShown = 0
+end
+
+track(RunService.Heartbeat:Connect(function(dt)
+	trapAcc += dt
+	if trapAcc < 0.25 then
+		return
+	end
+	trapAcc = 0
+	if not S.trapEsp then
+		if next(trapLights) then
+			clearTraps()
+		end
+		return
+	end
+	local folder = workspace:FindFirstChild("PiegesOurs")
+	-- Orange = armed, red = closed on someone (user asked 2026-11-12 to keep caught traps visible).
+	local want = {}
+	if folder then
+		for _, trap in ipairs(folder:GetChildren()) do
+			if trap:IsA("Model") then
+				want[trap] = trap:GetAttribute("Etat") == "ferme" and TRAP_CAUGHT_COLOR or TRAP_COLOR
+			end
+		end
+	end
+	local n = 0
+	for trap, color in pairs(want) do
+		n += 1
+		local h = trapLights[trap]
+		if not h then
+			h = Instance.new("Highlight")
+			h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+			h.FillTransparency = 0.5
+			h.OutlineTransparency = 0
+			h.Adornee = trap
+			h.Parent = outlineFolder
+			trapLights[trap] = h
+		end
+		h.FillColor = color
+		h.OutlineColor = color
+	end
+	for trap, h in pairs(trapLights) do
+		if not want[trap] or not trap.Parent then
+			h:Destroy()
+			trapLights[trap] = nil
+		end
+	end
+	S.trapsShown = n
+end))
+
+-- Trap actions, read from PlayerScripts.BearTrapClient 2026-11-12. All three are hold actions whose
+-- progress the SERVER runs (trap attr Progres 0-1, Aide = being helped): the client sends
+-- BearTrap:FireServer(action, trap, true) when the hold starts and (action, trap, false) when it ends.
+--   liberer    = break yourself free (char attr PiegeOurs)
+--   aider      = help a caught teammate (trap Etat "ferme", ObjectValue Victime = their character)
+--   desamorcer = disarm an armed trap (Etat "arme"); the game only offers it within 8.5 studs
+-- Traps snap shut at ~3 studs (server distance check, measured 2026-11-12), so disarm keeps 4+.
+-- Teleport to Help pins us next to the caught teammate's trap every Heartbeat while helping.
+local BearTrapRemote = ReplicatedStorage:WaitForChild("BearTrap", 10)
+local TRAP_DISARM_RANGE = 7
+local TRAP_HELP_RANGE = 6
+local trapHold = nil -- { action, trap, home }
+local trapPin = nil
+local trapAcc2 = 0
+S.trapFrees = S.trapFrees or 0
+S.trapHelps = S.trapHelps or 0
+S.trapDisarms = S.trapDisarms or 0
+
+local function trapVictim(trap)
+	local v = trap:FindFirstChild("Victime")
+	return v and v.Value
+end
+
+local function myRoot()
+	local ch = localPlayer.Character
+	return ch and ch:FindFirstChild("HumanoidRootPart")
+end
+
+local function releaseTrapHold(success)
+	if trapPin then
+		trapPin:Disconnect()
+		trapPin = nil
+	end
+	if not trapHold then
+		return
+	end
+	local hold = trapHold
+	trapHold = nil
+	pcall(function()
+		BearTrapRemote:FireServer(hold.action, hold.trap, false)
+	end)
+	if success then
+		if hold.action == "liberer" then
+			S.trapFrees += 1
+		elseif hold.action == "aider" then
+			S.trapHelps += 1
+		else
+			S.trapDisarms += 1
+		end
+	end
+	local root = myRoot()
+	if hold.home and S.helpTpBack and root then
+		root.CFrame = hold.home
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+end
+
+local function startTrapHold(action, trap, teleport)
+	releaseTrapHold(false)
+	local root = myRoot()
+	local hold = { action = action, trap = trap }
+	if teleport and root then
+		hold.home = root.CFrame
+		local function place()
+			local r = myRoot()
+			if r and trap.Parent then
+				local p = trap:GetPivot().Position
+				local away = Vector3.new(r.Position.X - p.X, 0, r.Position.Z - p.Z)
+				away = away.Magnitude > 0.1 and away.Unit or Vector3.new(1, 0, 0)
+				r.CFrame = CFrame.lookAt(p + away * 2.5 + Vector3.new(0, 3, 0), p + Vector3.new(0, 3, 0))
+				r.AssemblyLinearVelocity = Vector3.zero
+			end
+		end
+		place()
+		trapPin = RunService.Heartbeat:Connect(place)
+	end
+	trapHold = hold
+	-- Measured 2026-11-12: an "aider" sent on the same frame as the teleport was silently ignored
+	-- (server still had us far away); re-sent 0.4 s later it took at once (Aide=true, +0.26/s).
+	hold.sentAt = os.clock() + (hold.home and 0.4 or 0)
+	hold.progAt = trap:GetAttribute("Progres") or 0
+	hold.sent = false
+	S.trapLast = action .. " " .. os.date("%X")
+end
+
+-- Sends the hold once the teleport has replicated, and re-sends (false, true) if the server's
+-- progress hasn't moved 1 s after a send.
+local function serviceTrapHold()
+	local hold = trapHold
+	if not hold then
+		return
+	end
+	local now = os.clock()
+	if not hold.sent then
+		if now >= hold.sentAt then
+			BearTrapRemote:FireServer(hold.action, hold.trap, true)
+			hold.sent, hold.sentAt = true, now
+			hold.progAt = hold.trap:GetAttribute("Progres") or 0
+		end
+		return
+	end
+	local prog = hold.trap:GetAttribute("Progres") or 0
+	if prog > hold.progAt then
+		hold.progAt, hold.sentAt = prog, now
+	elseif now - hold.sentAt > 1 then
+		BearTrapRemote:FireServer(hold.action, hold.trap, false)
+		BearTrapRemote:FireServer(hold.action, hold.trap, true)
+		hold.sentAt = now
+		S.trapResends = (S.trapResends or 0) + 1
+	end
+end
+
+track(RunService.Heartbeat:Connect(function(dt)
+	trapAcc2 += dt
+	if trapAcc2 < 0.1 or not BearTrapRemote then
+		return
+	end
+	trapAcc2 = 0
+	local character = localPlayer.Character
+	local root = myRoot()
+	local folder = workspace:FindFirstChild("PiegesOurs")
+	local inRound = ReplicatedStorage:GetAttribute("Etat") == "EnJeu" and localPlayer:GetAttribute("EnManche") == true
+	if not (inRound and character and root and alive(character)) or amBlind() or not folder then
+		releaseTrapHold(false)
+		return
+	end
+
+	-- Keep or end the current hold.
+	if trapHold then
+		local trap, action = trapHold.trap, trapHold.action
+		local done
+		if not trap.Parent then
+			done = true
+		elseif action == "liberer" then
+			done = character:GetAttribute("PiegeOurs") ~= true
+		elseif action == "aider" then
+			local victim = trapVictim(trap)
+			done = trap:GetAttribute("Etat") ~= "ferme" or not victim or not alive(victim) or not S.autoHelp
+		else
+			done = trap:GetAttribute("Etat") ~= "arme" or not S.autoDisarm
+				or (trap:GetPivot().Position - root.Position).Magnitude > 8.5
+		end
+		if done then
+			releaseTrapHold(not trap.Parent or action ~= "desamorcer" or trap:GetAttribute("Etat") ~= "arme")
+		else
+			serviceTrapHold()
+		end
+		return
+	end
+
+	-- 1. Caught ourselves: break free.
+	if character:GetAttribute("PiegeOurs") == true then
+		if S.autoFree then
+			for _, trap in ipairs(folder:GetChildren()) do
+				if trap:GetAttribute("Etat") == "ferme" and trapVictim(trap) == character then
+					startTrapHold("liberer", trap, false)
+					return
+				end
+			end
+		end
+		return
+	end
+
+	-- 2. A teammate is caught: help (teleporting there if allowed).
+	if S.autoHelp then
+		local best, bestDist
+		for _, trap in ipairs(folder:GetChildren()) do
+			local victim = trapVictim(trap)
+			if trap:GetAttribute("Etat") == "ferme" and victim and victim ~= character and alive(victim) then
+				local d = (trap:GetPivot().Position - root.Position).Magnitude
+				if not bestDist or d < bestDist then
+					best, bestDist = trap, d
+				end
+			end
+		end
+		if best and (bestDist <= TRAP_HELP_RANGE or S.helpTp) then
+			startTrapHold("aider", best, bestDist > TRAP_HELP_RANGE)
+			return
+		end
+	end
+
+	-- 3. An armed trap nearby: disarm it.
+	if S.autoDisarm then
+		for _, trap in ipairs(folder:GetChildren()) do
+			if trap:GetAttribute("Etat") == "arme" and (trap:GetPivot().Position - root.Position).Magnitude <= TRAP_DISARM_RANGE then
+				startTrapHold("desamorcer", trap, false)
+				return
+			end
+		end
+	end
+end))
+Hub.releaseTrapHold = releaseTrapHold
+end
+
 --------------------------------------------------------------------------------
 -- Auto Grab Escape
 --------------------------------------------------------------------------------
@@ -1362,6 +1657,74 @@ track(localPlayer:GetAttributeChangedSignal("AFK"):Connect(function()
 	pcall(checkAfkMode)
 end))
 
+-- Auto Hang Up (hider Phone), verified live 2026-11-12: a call sets player attr AppelEntrant=true, puts a
+-- server Sound SonnerieHider on our HRP (everyone hears it for 10 s) and drops a temp TelephoneHider tool
+-- (attr Temporaire) in the Backpack. Raw "raccrocher_debut"+"raccrocher" with no equip and no gap was
+-- rejected; equip the phone, send debut, wait past the game's 0.5 s hold, send raccrocher -> ring stopped
+-- after 0.85 s. Equipping makes a short SonSortieObjet noise; unavoidable for now.
+local TelHider = ReplicatedStorage:WaitForChild("TelHider", 10)
+local HANGUP_HOLD = 0.6
+S.hangups = S.hangups or 0
+local hangupBusy = false
+
+local function autoHangUp()
+	if hangupBusy or not S.autoHangUp or not TelHider then
+		return
+	end
+	if localPlayer:GetAttribute("AppelEntrant") ~= true then
+		return
+	end
+	hangupBusy = true
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local phone = character and character:FindFirstChild("TelephoneHider")
+		or localPlayer.Backpack:WaitForChild("TelephoneHider", 2)
+	if humanoid and phone and phone.Parent ~= character then
+		humanoid:EquipTool(phone)
+	end
+	task.wait(0.15)
+	TelHider:FireServer("raccrocher_debut")
+	task.wait(HANGUP_HOLD)
+	if localPlayer:GetAttribute("AppelEntrant") == true then
+		TelHider:FireServer("raccrocher")
+	end
+	task.wait(0.4)
+	if localPlayer:GetAttribute("AppelEntrant") ~= true then
+		S.hangups += 1
+		print("[BBD] Auto Hang Up: hung up (" .. S.hangups .. ")")
+	else
+		print("[BBD] Auto Hang Up: still ringing after hang-up")
+	end
+	hangupBusy = false
+end
+
+-- Blackout first person, read from PlayerScripts.AnimObjetsHiders 2026-11-12: while RS Blackout is on
+-- and we're an in-round hider, it saves CameraMode and sets LockFirstPerson ONCE, then restores the
+-- saved mode when the blackout ends. Setting it back to Classic sticks. Holding a tool also forces
+-- first person in that script; that case is left alone.
+S.blackoutCamFixes = S.blackoutCamFixes or 0
+track(RunService.RenderStepped:Connect(function()
+	if not S.antiBlackout or ReplicatedStorage:GetAttribute("Blackout") ~= true then
+		return
+	end
+	if localPlayer.CameraMode ~= Enum.CameraMode.LockFirstPerson or amBlind() then
+		return
+	end
+	local character = localPlayer.Character
+	if character and character:FindFirstChildOfClass("Tool") then
+		return
+	end
+	localPlayer.CameraMode = Enum.CameraMode.Classic
+	S.blackoutCamFixes += 1
+end))
+
+track(localPlayer:GetAttributeChangedSignal("AppelEntrant"):Connect(function()
+	task.spawn(function()
+		pcall(autoHangUp)
+		hangupBusy = false
+	end)
+end))
+
 -- 3. Blind-man AFK, captured 2026-11-05: standing still for 25 s as the blind man in EnJeu makes the
 --    server set char attr BlindAFK, RS BlindAFK=userId, player AFK=true, Notification "You didn't move
 --    for 25s as the blind man", and end the round ("THE BLIND MAN WENT AFK — HIDERS WIN") in the same
@@ -1458,7 +1821,7 @@ track(RunService.Heartbeat:Connect(function()
 		return
 	end
 	local listening = (ReplicatedStorage:GetAttribute("EcouteActiveJusqua") or 0) > workspace:GetServerTimeNow()
-	if not (S.autoHeart and listening) then
+	if not ((S.autoHeart or S.noSlow) and listening) then
 		hearActive = false
 		hearRestored = false
 		for _, prop in ipairs(HEAR_PROPS) do
@@ -1482,6 +1845,62 @@ track(RunService.Heartbeat:Connect(function()
 				S.hearRestores = (S.hearRestores or 0) + 1
 			end
 		end
+	end
+end))
+
+-- No Slowdown (2026-11-12, user rule: "whenever you're a hider/blind man and your speed drops below
+-- what it should, restore to normal"). Only during Etat EnJeu (the Intro freeze is the round start).
+-- Normal speeds measured 2026-11-03: hider 8, sneak (Discret) 2, named blind man 12. Anarchy and
+-- infected speeds were never measured, so for them the highest speed seen this round is used.
+-- Skipped while carried (Porte) or ragdolled, where WalkSpeed isn't what holds you.
+-- Known slowdowns this covers: Witch Brew 4, Hearing Aids 0, Funky Stim 0, plus anything new.
+local BLIND_SPEED = 12
+local learnedSpeed, learnedRound = 0, nil
+S.slowRestores = S.slowRestores or 0
+
+local function normalSpeed()
+	if isBlindPlayer(localPlayer) then
+		return BLIND_SPEED
+	end
+	if amBlind() then
+		return learnedSpeed > 0 and learnedSpeed or nil
+	end
+	-- Bear trap injury (2026-11-12): breaking free sets DiscretPiege + Discret = forced sneak at 2 until a
+	-- medkit. That's a slowdown, so walk at 8; the server's Discret flag (quiet) stays on.
+	if localPlayer:GetAttribute("Discret") == true and not S.alwaysSneak
+		and localPlayer:GetAttribute("DiscretPiege") ~= true then
+		return SNEAK_SPEED
+	end
+	return HIDER_SPEED
+end
+
+track(RunService.Heartbeat:Connect(function()
+	if not S.noSlow then
+		return
+	end
+	if ReplicatedStorage:GetAttribute("Etat") ~= "EnJeu" or localPlayer:GetAttribute("EnManche") ~= true then
+		learnedSpeed, learnedRound = 0, nil
+		return
+	end
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+	if character:GetAttribute("Porte") == true or character:GetAttribute("RagdollChute") == true
+		or character:GetAttribute("Ragdoll") == true then
+		return
+	end
+	if learnedRound ~= character then
+		learnedRound, learnedSpeed = character, 0
+	end
+	if amBlind() and not isBlindPlayer(localPlayer) then
+		learnedSpeed = math.max(learnedSpeed, math.min(humanoid.WalkSpeed, 16))
+	end
+	local target = normalSpeed()
+	if target and humanoid.WalkSpeed < target then
+		humanoid.WalkSpeed = target
+		S.slowRestores += 1
 	end
 end))
 
@@ -1818,7 +2237,17 @@ local Tabs = {
 	Status = Window:AddTab({ Title = "Status", Icon = "activity" }),
 }
 
-Tabs.Blind:AddToggle("See", {
+do -- menu (scoped: section locals)
+-- Menu layout (sections added 2026-11-12). Toggle ids are unchanged so saved prefs carry over.
+
+--------------------------------------------------------------------------------
+-- Blind Man tab
+--------------------------------------------------------------------------------
+local BlindVision = Tabs.Blind:AddSection("Vision")
+local BlindGun = Tabs.Blind:AddSection("Shotgun")
+local BlindCounters = Tabs.Blind:AddSection("Gadget Counters")
+
+BlindVision:AddToggle("See", {
 	Title = "See While Blind",
 	Description = "Normal bright view during your blind rounds. Press F6 to toggle",
 	Default = pref("See", true),
@@ -1827,7 +2256,7 @@ Tabs.Blind:AddToggle("See", {
 	S.disabled = not v
 end)
 
-Tabs.Blind:AddToggle("NoRecoil", {
+BlindGun:AddToggle("NoRecoil", {
 	Title = "No Shotgun Recoil",
 	Description = "Skips the knockback and camera flip when you fire",
 	Default = pref("NoRecoil", false),
@@ -1835,7 +2264,7 @@ Tabs.Blind:AddToggle("NoRecoil", {
 	S.noRecoil = v
 end)
 
-Tabs.Blind:AddToggle("SilentAim", {
+BlindGun:AddToggle("SilentAim", {
 	Title = "Silent Aim",
 	Description = "Shots go to the visible target nearest your crosshair",
 	Default = pref("SilentAim", false),
@@ -1843,7 +2272,7 @@ Tabs.Blind:AddToggle("SilentAim", {
 	S.silentAim = v
 end)
 
-Tabs.Blind:AddSlider("AimFov", {
+BlindGun:AddSlider("AimFov", {
 	Title = "Silent Aim FOV",
 	Description = "Pixels from your crosshair a target can be",
 	Default = pref("AimFov", AIM_FOV_DEFAULT),
@@ -1855,7 +2284,7 @@ Tabs.Blind:AddSlider("AimFov", {
 	fovPreviewUntil = os.clock() + FOV_PREVIEW_SECONDS
 end)
 
-Tabs.Blind:AddToggle("AntiStim", {
+BlindCounters:AddToggle("AntiStim", {
 	Title = "Anti Funky Stim",
 	Description = "When a hider stims you: keep walking, skip the dance, shotgun back in hand",
 	Default = pref("AntiStim", true),
@@ -1863,7 +2292,7 @@ Tabs.Blind:AddToggle("AntiStim", {
 	antiStimOn = v
 end)
 
-Tabs.Blind:AddToggle("AntiSerum", {
+BlindCounters:AddToggle("AntiSerum", {
 	Title = "Anti Scary Serum",
 	Description = "When a hider uses the Scary Serum: normal controls, no fake footsteps or coughs",
 	Default = pref("AntiSerum", true),
@@ -1871,23 +2300,64 @@ Tabs.Blind:AddToggle("AntiSerum", {
 	S.antiSerum = v
 end)
 
-Tabs.Misc:AddToggle("Jump", {
-	Title = "Jump",
-	Description = "Lets you jump again (the game turns jumping off). Keep Anti Fall Ragdoll on so landings don't ragdoll you",
-	Default = pref("Jump", false),
+--------------------------------------------------------------------------------
+-- Hider tab
+--------------------------------------------------------------------------------
+-- Section order = what people use most first (user, 2026-11-12): bear traps are niche, so last.
+local HiderEscape = Tabs.Hider:AddSection("Stealth & Escape")
+local HiderCounters = Tabs.Hider:AddSection("Gadget Counters")
+local HiderInject = Tabs.Hider:AddSection("Injections")
+local HiderTraps = Tabs.Hider:AddSection("Bear Traps")
+
+HiderTraps:AddToggle("TrapEsp", {
+	Title = "Trap ESP",
+	Description = "Bear traps through walls: orange = armed, red = caught someone",
+	Default = pref("TrapEsp", true),
 }):OnChanged(function(v)
-	S.jump = v
+	S.trapEsp = v
 end)
 
-Tabs.Misc:AddToggle("AntiPush", {
-	Title = "Anti Push",
-	Description = "Ignores the fling and ragdoll when someone pushes you",
-	Default = pref("AntiPush", false),
+HiderTraps:AddToggle("AutoDisarm", {
+	Title = "Auto Disarm",
+	Description = "Disarms armed traps within 7 studs of you (they snap at 3, so walk past, not over)",
+	Default = pref("AutoDisarm", true),
 }):OnChanged(function(v)
-	S.antiPush = v
+	S.autoDisarm = v
 end)
 
-Tabs.Hider:AddToggle("AutoHeart", {
+HiderTraps:AddToggle("AutoFree", {
+	Title = "Auto Break Free",
+	Description = "Starts breaking free the moment you're caught and keeps holding until you're out",
+	Default = pref("AutoFree", true),
+}):OnChanged(function(v)
+	S.autoFree = v
+end)
+
+HiderTraps:AddToggle("AutoHelp", {
+	Title = "Auto Help Teammates",
+	Description = "Helps free a caught teammate within 6 studs (help makes it faster)",
+	Default = pref("AutoHelp", true),
+}):OnChanged(function(v)
+	S.autoHelp = v
+end)
+
+HiderTraps:AddToggle("HelpTp", {
+	Title = "Teleport to Help",
+	Description = "Auto Help teleports you to a caught teammate from anywhere and holds you there until they're free",
+	Default = pref("HelpTp", false),
+}):OnChanged(function(v)
+	S.helpTp = v
+end)
+
+HiderTraps:AddToggle("HelpTpBack", {
+	Title = "Return After Helping",
+	Description = "After a teleport help, go back to where you were",
+	Default = pref("HelpTpBack", true),
+}):OnChanged(function(v)
+	S.helpTpBack = v
+end)
+
+HiderCounters:AddToggle("AutoHeart", {
 	Title = "Anti Hearing Aids",
 	Description = "When the blind man uses Hearing Aids: no heart minigame screen, no freeze, and he never gets your heartbeat",
 	Default = pref("AutoHeart", true),
@@ -1895,7 +2365,37 @@ Tabs.Hider:AddToggle("AutoHeart", {
 	S.autoHeart = v
 end)
 
-Tabs.Hider:AddToggle("AutoInject", {
+HiderCounters:AddToggle("AntiBlackout", {
+	Title = "Anti Blackout",
+	Description = "Blocks the power outage when the blind man uses Night Vision (dark, fog, lights off, forced first person)",
+	Default = pref("AntiBlackout", true),
+}):OnChanged(function(v)
+	S.antiBlackout = v
+	if v and S.blackoutRetirer then
+		pcall(S.blackoutRetirer)
+	end
+end)
+
+HiderCounters:AddToggle("AutoHangUp", {
+	Title = "Auto Hang Up",
+	Description = "Hangs up when someone calls you with the Phone, so it only rings for under a second instead of 10",
+	Default = pref("AutoHangUp", true),
+}):OnChanged(function(v)
+	S.autoHangUp = v
+	if v then
+		task.spawn(pcall, autoHangUp)
+	end
+end)
+
+HiderCounters:AddToggle("Phone", {
+	Title = "Auto Phone Popup",
+	Description = "Closes the blind man's Phone popup ads for you. Untested, may be ignored",
+	Default = pref("Phone", false),
+}):OnChanged(function(v)
+	phoneOn = v
+end)
+
+HiderInject:AddToggle("AutoInject", {
 	Title = "Auto Inject",
 	Description = "Uses your Funky Stim or Scary Serum on the blind man as soon as he's within range and it's off cooldown",
 	Default = pref("AutoInject", false),
@@ -1903,7 +2403,7 @@ Tabs.Hider:AddToggle("AutoInject", {
 	S.autoInject = v
 end)
 
-Tabs.Hider:AddToggle("InjectTp", {
+HiderInject:AddToggle("InjectTp", {
 	Title = "Teleport to Inject",
 	Description = "Auto Inject teleports you to the blind man from any distance. Only when you have a serum or stim off cooldown",
 	Default = pref("InjectTp", false),
@@ -1911,7 +2411,7 @@ Tabs.Hider:AddToggle("InjectTp", {
 	S.injectTp = v
 end)
 
-Tabs.Hider:AddToggle("InjectTpBack", {
+HiderInject:AddToggle("InjectTpBack", {
 	Title = "Teleport Back After",
 	Description = "After a teleport injection, go back to where you were",
 	Default = pref("InjectTpBack", true),
@@ -1919,7 +2419,7 @@ Tabs.Hider:AddToggle("InjectTpBack", {
 	S.injectTpBack = v
 end)
 
-Tabs.Hider:AddToggle("AlwaysSneak", {
+HiderEscape:AddToggle("AlwaysSneak", {
 	Title = "Always Sneak",
 	Description = "Stays in sneak during rounds at normal walking speed",
 	Default = pref("AlwaysSneak", false),
@@ -1931,18 +2431,7 @@ Tabs.Hider:AddToggle("AlwaysSneak", {
 	end
 end)
 
-Tabs.Hider:AddToggle("AntiShake", {
-	Title = "Anti Screen Shake",
-	Description = "All camera shake: blind man, gunshots, megaphone, grabs, firecrackers",
-	Default = pref("AntiShake", false),
-}):OnChanged(function(v)
-	S.antiShake = v
-	if not v then
-		restoreShake()
-	end
-end)
-
-Tabs.Hider:AddToggle("Escape", {
+HiderEscape:AddToggle("Escape", {
 	Title = "Auto Grab Escape",
 	Description = "Breaks free of grabs without mashing, about 2.5 seconds in",
 	Default = pref("Escape", false),
@@ -1954,15 +2443,50 @@ Tabs.Hider:AddToggle("Escape", {
 	end
 end)
 
-Tabs.Hider:AddToggle("Phone", {
-	Title = "Auto Phone Popup",
-	Description = "Completes the phone popup for you. Untested, may be ignored",
-	Default = pref("Phone", false),
+--------------------------------------------------------------------------------
+-- Misc tab
+--------------------------------------------------------------------------------
+local MiscVisual = Tabs.Misc:AddSection("Visuals")
+local MiscMove = Tabs.Misc:AddSection("Movement")
+local MiscSafety = Tabs.Misc:AddSection("Safety")
+local MiscHub = Tabs.Misc:AddSection("Hub")
+
+MiscMove:AddToggle("NoSlow", {
+	Title = "No Slowdown",
+	Description = "During rounds, anything that drops your speed below normal (Hearing Aids, Witch Brew, Funky Stim, trap injury...) gets undone",
+	Default = pref("NoSlow", true),
 }):OnChanged(function(v)
-	phoneOn = v
+	S.noSlow = v
 end)
 
-Tabs.Misc:AddToggle("Outlines", {
+MiscMove:AddToggle("Jump", {
+	Title = "Jump",
+	Description = "Lets you jump again (the game turns jumping off). Keep Anti Fall Ragdoll on so landings don't ragdoll you",
+	Default = pref("Jump", false),
+}):OnChanged(function(v)
+	S.jump = v
+end)
+
+MiscMove:AddToggle("AntiPush", {
+	Title = "Anti Push",
+	Description = "Ignores the fling and ragdoll when someone pushes you",
+	Default = pref("AntiPush", false),
+}):OnChanged(function(v)
+	S.antiPush = v
+end)
+
+MiscMove:AddToggle("AntiFall", {
+	Title = "Anti Fall Ragdoll",
+	Description = "No ragdoll from falling or long jumps (both roles). Pushes still work as usual unless Anti Push is on",
+	Default = pref("AntiFall", true),
+}):OnChanged(function(v)
+	S.antiFall = v
+	if v then
+		pcall(hookFallRagdoll)
+	end
+end)
+
+MiscVisual:AddToggle("Outlines", {
 	Title = "Player Outlines",
 	Description = "Through walls. Red = blind man or infected, white = hider",
 	Default = pref("Outlines", false),
@@ -1973,7 +2497,18 @@ Tabs.Misc:AddToggle("Outlines", {
 	end
 end)
 
-Tabs.Misc:AddToggle("Staff", {
+MiscVisual:AddToggle("AntiShake", {
+	Title = "Anti Screen Shake",
+	Description = "All camera shake: blind man, gunshots, megaphone, grabs, firecrackers",
+	Default = pref("AntiShake", false),
+}):OnChanged(function(v)
+	S.antiShake = v
+	if not v then
+		restoreShake()
+	end
+end)
+
+MiscSafety:AddToggle("Staff", {
 	Title = "Staff Alert",
 	Description = "Warns you when a listed owner, admin or mod is in the server",
 	Default = pref("Staff", true),
@@ -1986,18 +2521,7 @@ Tabs.Misc:AddToggle("Staff", {
 	end
 end)
 
-Tabs.Misc:AddToggle("AntiFall", {
-	Title = "Anti Fall Ragdoll",
-	Description = "No ragdoll from falling or long jumps (both roles). Pushes still work as usual unless Anti Push is on",
-	Default = pref("AntiFall", true),
-}):OnChanged(function(v)
-	S.antiFall = v
-	if v then
-		pcall(hookFallRagdoll)
-	end
-end)
-
-Tabs.Misc:AddToggle("AntiAfk", {
+MiscSafety:AddToggle("AntiAfk", {
 	Title = "Anti AFK",
 	Description = "Blocks the idle kick, turns the game's AFK mode back off, and steps you a few studs if you stand still 12 s as the blind man (the server ends the round at 25 s)",
 	Default = pref("AntiAfk", true),
@@ -2009,13 +2533,14 @@ Tabs.Misc:AddToggle("AntiAfk", {
 	end
 end)
 
-Tabs.Misc:AddButton({
+MiscHub:AddButton({
 	Title = "Unload Hub",
 	Description = "Removes the menu and turns everything off",
 	Callback = function()
 		Hub.cleanup()
 	end,
 })
+end
 
 local statusParagraph = Tabs.Status:AddParagraph({ Title = "Round", Content = "Loading..." })
 local featureParagraph = Tabs.Status:AddParagraph({ Title = "Features", Content = "Loading..." })
@@ -2122,6 +2647,9 @@ function Hub.cleanup()
 			S.prefs[key] = option.Value
 		end
 	end
+	if Hub.releaseTrapHold then
+		pcall(Hub.releaseTrapHold, false)
+	end
 	S.enabled = false
 	S.disabled = true
 	S.noRecoil = false
@@ -2175,6 +2703,12 @@ task.spawn(function()
 	local heartOk, heartResult, heartWhy = pcall(hookHeart)
 	if not heartOk or not heartResult then
 		notify("Anti Hearing Aids", "Hook failed: " .. tostring(heartWhy or heartResult), 8)
+	end
+	local boOk, boResult, boWhy = pcall(hookBlackout)
+	if not boOk or not boResult then
+		notify("Anti Blackout", "Hook failed: " .. tostring(boWhy or boResult), 8)
+	elseif S.antiBlackout and S.blackoutRetirer then
+		pcall(S.blackoutRetirer)
 	end
 end)
 notify("blind but dangerous", "Loaded. RightControl hides the menu.", 5)
